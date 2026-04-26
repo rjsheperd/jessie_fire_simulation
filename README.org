@@ -1,0 +1,351 @@
+#+TITLE: Jessie Fire Simulation
+#+AUTHOR: RJ Sheperd
+#+DATE: 2026-04-26
+
+* Overview
+
+Wildfire spread simulation using the Rothermel fire behavior model, with both
+a server-side C++/CUDA backend and a client-side WebGPU compute pipeline. The
+browser path runs the entire simulation on the GPU — no server-side CUDA
+needed.
+
+A Flask web server hosts the visualization UI (Google Maps overlay + canvas
+animation), serves simulation input data, and provides REST API endpoints for
+editing vegetation and fire parameters.
+
+* Quick Start
+
+** Python Server
+
+#+BEGIN_SRC shell
+pip install -r requirements.txt
+python views.py -h <machine-ip> -p 5000 --threaded
+#+END_SRC
+
+Flask runs in debug mode on =0.0.0.0:5000= by default. For WebGPU, use a
+Chromium-based browser (Chrome 113+, Brave) with WebGPU enabled.
+
+** C++ Simulator (server-side fallback)
+
+#+BEGIN_SRC shell
+git submodule update --init --recursive
+cd fire_sim_lib && mkdir -p build && cd build
+cmake .. && make
+#+END_SRC
+
+Requires CUDA toolkit and GDAL. The Python server invokes the binary via
+subprocess: =./simulator [veg_file] [fire_file] [output.csv] [wind_x] [wind_y]=
+
+** Stress Tests
+
+#+BEGIN_SRC shell
+bun install
+python views.py -p 5001 &
+bun run test_stress.mjs --suite correctness
+bun run test_stress.mjs --suite all
+#+END_SRC
+
+Uses Playwright + Brave for headless WebGPU testing. Suites: =scale=,
+=concurrency=, =numerical=, =correctness=, =perf=, =error=, =all=.
+
+* Fire Spread Model
+
+** Rothermel Surface Fire
+
+The simulation implements the Rothermel (1972) surface fire spread model, the
+standard used by US wildland fire management tools (FARSITE, BehavePlus,
+FlamMap). It predicts the rate of spread (ROS) as a function of fuel
+properties, moisture content, wind speed, and terrain slope.
+
+Core equation:
+
+#+BEGIN_EXAMPLE
+ROS = (reaction_intensity * propagating_flux * (1 + wind_factor + slope_factor))
+      / (bulk_density * effective_heating_number * heat_of_preignition)
+#+END_EXAMPLE
+
+The model decomposes spread into an elliptical shape oriented along the
+resultant wind+slope vector. The head fire (downwind) spreads fastest; the
+flank and back fire follow the ellipse geometry parameterized by the
+length-to-breadth ratio (LBR):
+
+#+BEGIN_EXAMPLE
+LBR = 1 + 0.002840909 * effective_windspeed
+eccentricity = sqrt(LBR^2 - 1) / LBR
+#+END_EXAMPLE
+
+The maximum spread rate is decomposed into 8 directional rates used by the
+propagation kernels (N, NE, E, SE, S, SW, W, NW):
+
+#+BEGIN_EXAMPLE
+rate[dir] = maxROS * (1 - eccentricity) /
+            (1 - eccentricity * cos(spread_direction - angle[dir]))
+#+END_EXAMPLE
+
+** Crown Fire
+
+Crown fire is modeled as a binary transition: when surface fire intensity
+exceeds the canopy initiation threshold =I_o=, the spread rate escalates to
+the active crown fire rate. Crown fire check runs every 10th timestep.
+
+#+BEGIN_EXAMPLE
+I_o = (0.01 * CBH * (460 + 25.9 * foliar_moisture))^1.5
+RAC = 3.0 / CBD     (rate of active crowning)
+#+END_EXAMPLE
+
+Where =CBH= is canopy base height (m) and =CBD= is crown bulk density (kg/m^3).
+
+** Acceleration
+
+Fire starts at a reduced rate and accelerates toward the computed maximum over
+time. The acceleration model uses an exponential approach:
+
+#+BEGIN_EXAMPLE
+cur_rate = clamp(timestep - ratio, 0, 1) * (max_rate - cur_rate) + cur_rate
+#+END_EXAMPLE
+
+Acceleration constant defaults to 0.115 and is applied every 5th timestep.
+
+* Input Parameters
+
+** Fuel Models (=.fmd= file)
+
+Each fuel model is defined by 12 parameters, following the Anderson 13 /
+Scott-Burgan 40 classification:
+
+| Parameter           | Unit        | Description                              |
+|---------------------+-------------+------------------------------------------|
+| Fuel load (dead 1h) | tons/acre   | Fine dead fuel (< 0.25" diameter)        |
+| Fuel load (dead 10h) | tons/acre  | Medium dead fuel (0.25-1" diameter)      |
+| Fuel load (dead 100h) | tons/acre | Coarse dead fuel (1-3" diameter)         |
+| Fuel load (live herb) | tons/acre | Live herbaceous fuel                     |
+| Fuel load (live wood) | tons/acre | Live woody fuel                          |
+| SAV ratio (dead 1h) | 1/ft        | Surface area to volume, fine dead        |
+| SAV ratio (live herb) | 1/ft      | Surface area to volume, live herbaceous  |
+| SAV ratio (live wood) | 1/ft      | Surface area to volume, live woody       |
+| Fuel depth          | ft          | Depth of the fuel bed                    |
+| Extinction moisture | fraction    | Dead fuel moisture of extinction         |
+| Dead heat content   | BTU/lb      | Heat content of dead fuel                |
+| Live heat content   | BTU/lb      | Heat content of live fuel                |
+
+Fixed SAV ratios: dead 10h = 109 ft^{-1}, dead 100h = 30 ft^{-1}.
+
+File format: one line per model, 13 space-separated tokens:
+=modelNumber load1h load10h load100h loadLH loadLW sav1h savLH savLW depth extinctionMoisture heatDead heatLive=
+
+** Fuel Moisture (=.fms= file)
+
+Per-model moisture values as integer percentages (divided by 100 internally):
+
+| Parameter | Description                            |
+|-----------+----------------------------------------|
+| dead 1h   | Fine dead fuel moisture (time-lag < 1h) |
+| dead 10h  | Medium dead fuel moisture              |
+| dead 100h | Coarse dead fuel moisture              |
+| live H    | Live herbaceous moisture               |
+| live W    | Live woody moisture                    |
+
+File format: =modelNumber dead1h dead10h dead100h liveH liveW=
+
+Moisture assignment by SAV: particles with SAV > 192 use dead 1h moisture,
+> 48 use dead 10h, otherwise dead 100h.
+
+** Terrain (=.tif= or =.asc=)
+
+Three bands per cell:
+
+| Band    | Unit    | Description              |
+|---------+---------+--------------------------|
+| Slope   | degrees | Terrain slope angle      |
+| Aspect  | degrees | Downhill direction (0=N) |
+| Elevation | meters | Surface elevation        |
+
+** Wind (=.asc= / =.fuel= grids)
+
+Two grids providing per-cell wind vectors:
+
+| Grid   | Unit | Description                |
+|--------+------+----------------------------|
+| Wind X | m/s  | East-west wind component   |
+| Wind Y | m/s  | North-south wind component |
+
+Effective windspeed is capped at =0.9 * reaction_intensity= to prevent
+numerical instability in the ellipse model.
+
+** Fire Ignition (CSV)
+
+8-line header followed by comma-separated integer grid:
+
+| Header field     | Description                      |
+|------------------+----------------------------------|
+| left_top_lat     | NW corner latitude               |
+| left_top_long    | NW corner longitude              |
+| right_bottom_lat | SE corner latitude               |
+| right_bottom_long | SE corner longitude             |
+| numrows          | Grid rows (default 642)          |
+| numcols          | Grid columns (default 906)       |
+| notsetfire       | Sentinel value (typically 32767) |
+| maxval           | Maximum ignition time in data    |
+
+Cell values: =1= = ignited at time 0, =32767= (=notsetfire=) = not ignited.
+
+** Canopy Structure (=.asc= grids)
+
+| File                | Unit   | Description                    |
+|---------------------+--------+--------------------------------|
+| canopy_ht.asc       | meters | Canopy height                  |
+| crown_base_ht.asc   | meters | Height to live crown base      |
+| crown_bulk_density.asc | kg/m^3 | Crown fuel loading per volume |
+
+* Simulation Grid
+
+Default grid: 906 columns x 642 rows = 581,652 cells.
+
+| Parameter     | Default | Source                       |
+|---------------+---------+------------------------------|
+| Columns       |     906 | DEM terrain grid             |
+| Rows          |     642 | DEM terrain grid             |
+| Cell size     |   30.0m | Fuel grid metadata           |
+| Timestep      |    auto | =max_spread / cell_size=     |
+| Notsetfire    |   32767 | Fire ignition file header    |
+| Foliar moisture | 1.0   | Hardcoded in manifest        |
+
+The vegetation grid (203x287) is upsampled to match the terrain grid (906x642)
+via =util.py:fit_high_resolution_into_low()=.
+
+* Architecture
+
+** Data Flow (WebGPU path)
+
+#+BEGIN_EXAMPLE
+Browser loads page
+  -> fetch /api/sim_data_manifest (JSON: file paths, grid dimensions)
+  -> fetch input data files (fuel, terrain, wind, fire, canopy)
+  -> parse & pack data in JavaScript
+  -> GPU Rothermel: compute spread rates, burn distances (one-time)
+  -> GPU FIM: solve fire arrival times via wavefront expansion
+  -> readback Float32Array of arrival times
+  -> convert to fire_data format for canvas animation
+#+END_EXAMPLE
+
+** Data Flow (server-side fallback)
+
+#+BEGIN_EXAMPLE
+Browser -> Flask REST API -> file I/O + subprocess -> C++ CUDA simulator
+  -> CSV output -> JSON API response -> canvas animation
+#+END_EXAMPLE
+
+Falls back automatically when =navigator.gpu= is unavailable.
+
+** WebGPU Compute Pipeline
+
+The GPU pipeline has two phases:
+
+*** Phase 1: Initialization (one-time)
+
+=rothermel.wgsl= — One thread per cell computes:
+- Surface fire spread rate and direction (Rothermel model)
+- Elliptical decomposition into 8 directional max spread rates
+- Burn distances for 8 neighbors
+- Crown fire parameters (I_o, RAC)
+- Packed per-cell scalars (intensity modifier, acceleration constant)
+
+10 GPU bindings (9 storage + 1 uniform). Outputs directly to simulation
+buffers. Global maximum spread rate reduced via atomic CAS for timestep
+computation.
+
+*** Phase 2: Fire Propagation (FIM solver)
+
+=fim_solve.wgsl= — Fast Iterative Method for the Eikonal equation. Replaces
+the fixed-timestep burn distance loop with convergence-based wavefront
+expansion.
+
+1. =compact_active.wgsl= builds initial active list (ignited cells with unignited neighbors)
+2. FIM iterates with ping-pong active lists:
+   - Each active cell propagates to 8 neighbors: =T_new = T_cell + dist / ROS=
+   - Arrival time updated via atomic compare-and-swap minimum
+   - Successfully updated neighbors appended to next active list
+   - =dispatchWorkgroupsIndirect= self-terminates when active list empties
+3. Maximum iterations: =rows + cols= (conservative bound)
+
+The FIM path is step-count independent — it converges based on grid geometry,
+not a fixed number of timesteps.
+
+** Key Files
+
+| File                             | Purpose                                   |
+|----------------------------------+-------------------------------------------|
+| =views.py=                       | Flask routes, REST API, data serving      |
+| =util.py=                        | Data parsing, resolution mapping, subprocess |
+| =static/js/webgpu_main.js=       | WebGPU initialization, data packing, orchestration |
+| =static/js/webgpu_sim.js=        | GPU buffer management, pipeline dispatch  |
+| =static/js/rothermel.js=         | CPU Rothermel (fallback / reference)      |
+| =static/js/fuel_models.js=       | Fuel model parsing and data structures    |
+| =static/js/fire_2D_map.js=       | Canvas visualization, Google Maps overlay |
+| =static/js/shaders/rothermel.wgsl= | GPU Rothermel compute shader            |
+| =static/js/shaders/fim_solve.wgsl= | FIM Eikonal wavefront solver            |
+| =static/js/shaders/burn_dist.wgsl= | Legacy BD fire propagation (replaced by FIM) |
+| =static/js/shaders/accelerate.wgsl= | ROS acceleration toward maximum        |
+| =static/js/shaders/crown_rate.wgsl= | Crown fire escalation                  |
+| =static/js/shaders/compact_active.wgsl= | Active cell compaction + indirect dispatch |
+| =fire_sim_lib/=                  | C++/CUDA simulator (git submodule)        |
+
+* API Endpoints
+
+| Method | Route                             | Purpose                        |
+|--------+-----------------------------------+--------------------------------|
+| GET    | =/api/sim_data_manifest=           | Simulation input file paths + grid dimensions |
+| GET    | =/api/veg_data=                    | Vegetation grid                |
+| GET    | =/api/fire_data=                   | Full fire results (server-side) |
+| GET    | =/api/fire_data/metadata=          | Bounding coords + dimensions   |
+| GET    | =/api/fire_frame_data/<start>/<end>= | Time-sliced fire data        |
+| POST   | =/api/update_veg_file=             | Update vegetation, re-run sim  |
+| POST   | =/api/update_fire_file=            | Update fire locations, re-run  |
+| POST   | =/api/update_fire_info=            | Update fire info from UI       |
+| GET    | =/fire_vis/<folder_name>=          | Load existing dataset          |
+
+Wind variants append =/<wind_x>/<wind_y>= to update/upload routes.
+
+The manifest endpoint accepts query params for stress testing:
+=?cols=N&rows=N&steps=N&mode=synthetic= generates synthetic data in-browser.
+
+* Output Format
+
+The simulation produces a flat =Float32Array= of fire arrival times (one float
+per cell). Values represent the time at which fire reached each cell:
+
+| Value | Meaning                              |
+|-------+--------------------------------------|
+| 0.0   | Ignited at simulation start          |
+| > 0   | Arrived at this time (arbitrary units) |
+| 32767 | Never reached (unburned)             |
+
+The WebGPU path converts this to a 2D string array matching the server-side
+=/api/fire_data= JSON format for compatibility with the existing canvas
+animation code.
+
+* Performance
+
+Measured on Apple Silicon (M-series), 906x642 grid, Brave browser:
+
+| Phase                   | GPU (ms) | Total (ms) | GPU Speedup |
+|-------------------------+----------+------------+-------------|
+| Baseline (CUDA path)    |      970 |       1900 |          1x |
+| Phase 0 (micro-opts)    |      678 |       1625 |       1.43x |
+| Phase 1 (active cells)  |      273 |       1309 |       3.55x |
+| Phase 3 (memory layout) |      221 |       1205 |       4.39x |
+| GPU Rothermel            |      207 |       1015 |       4.69x |
+| FIM solver (current)    |       74 |        956 |      13.1x  |
+
+See [[file:OPTIMIZE.org][OPTIMIZE.org]] for detailed optimization history and methodology.
+
+* References
+
+- Rothermel, R.C. (1972). A mathematical model for predicting fire spread in
+  wildland fuels. USDA Forest Service Research Paper INT-115.
+- Anderson, H.E. (1982). Aids to determining fuel models for estimating fire
+  behavior. USDA Forest Service General Technical Report INT-122.
+- Scott, J.H. & Burgan, R.E. (2005). Standard fire behavior fuel models.
+  USDA Forest Service General Technical Report RMRS-GTR-153.
+- Jeong, W. & Whitaker, R. (2008). A fast iterative method for eikonal
+  equations. SIAM Journal on Scientific Computing, 30(5), 2512-2534.

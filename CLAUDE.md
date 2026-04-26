@@ -4,74 +4,106 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Jessie Fire Simulation: a Python Flask web server with a CUDA/C++ fire simulation backend and JavaScript canvas-based visualization frontend. The C++ simulator lives in the `fire_sim_lib` git submodule.
+Jessie Fire Simulation: wildfire spread simulation using the Rothermel model. Two execution paths:
+1. **WebGPU (primary)** — entire simulation runs client-side on the GPU via compute shaders
+2. **CUDA fallback** — server-side C++/CUDA binary (`fire_sim_lib` submodule) invoked via Flask subprocess
+
+Flask web server hosts the visualization UI (Google Maps + canvas) and serves input data.
 
 ## Build & Run
-
-### Python server
 
 ```bash
 pip install -r requirements.txt
 python views.py -h <machine-ip> -p 5000 --threaded
 ```
 
-Flask runs in debug mode on 0.0.0.0:5000 by default.
+For WebGPU: use Brave or Chrome 113+ with WebGPU enabled. Navigate to `/fire_vis/unr_aa_1`.
 
-### C++ simulator (fire_sim_lib submodule)
+### Stress Tests
 
 ```bash
-git submodule update --init --recursive
-cd fire_sim_lib && mkdir -p build && cd build
-cmake .. && make
+bun install
+python views.py -p 5001 &
+bun run test_stress.mjs --suite correctness
+bun run test_stress.mjs --suite all
 ```
 
-Produces `fire_sim_lib/build/simulator`. The Python server invokes this binary via subprocess:
-`./simulator [veg_file] [fire_file] [output.csv] [wind_x] [wind_y]`
-
-Requires CUDA toolkit and GDAL.
+Suites: `scale`, `concurrency`, `numerical`, `correctness`, `perf`, `error`, `all`.
 
 ## Architecture
 
-**Data flow:**
+### WebGPU path (primary)
 ```
-Browser (Canvas/Google Maps)
-  → Flask REST API (views.py)
-  → File I/O + subprocess (util.py)
-  → C++ CUDA simulator (fire_sim_lib)
-  → CSV output
-  → JSON API response
-  → Canvas animation (static/js/fire_2D_map.js)
+Browser → Flask /api/sim_data_manifest → fetch data files
+       → JS: parse & pack inputs
+       → GPU: rothermel.wgsl (one-time spread rate computation)
+       → GPU: compact_active.wgsl → fim_solve.wgsl (FIM wavefront solver)
+       → readback Float32Array of arrival times
+       → Canvas animation (fire_2D_map.js)
+```
+
+### CUDA fallback
+```
+Browser → Flask API → subprocess(./simulator) → CSV → JSON → Canvas
 ```
 
 ### Key files
 
-- `views.py` — All Flask routes. REST API endpoints under `/api/` plus HTML-serving routes for upload and visualization.
-- `util.py` — Data parsing (CSV→JSON), file writing, resolution conversion between DEM (642x906) and vegetation (203x287) grids, and subprocess execution of the C++ simulator. Log output goes to `log.txt`/`err_log.txt`.
-- `static/js/fire_2D_map.js` (~3300 lines) — Core visualization: canvas rendering, Google Maps overlay, fire propagation animation, interactive editing tools, time slider.
-- `fire_sim_lib/` — CUDA-accelerated fire spread simulation. Fire models: Behave (BD), Mark-3 Timber (MT), Improved MT (IMT), Sequential (SEQ). Entry point: `src/simulation.cu`.
+- `views.py` — Flask routes, REST API, data serving. Manifest endpoint at `/api/sim_data_manifest`.
+- `util.py` — Data parsing (CSV→JSON), resolution mapping (203x287 veg → 906x642 DEM), subprocess.
+- `static/js/webgpu_main.js` — WebGPU orchestration: fetch data, pack GPU inputs, run pipeline, convert output.
+- `static/js/webgpu_sim.js` — GPU buffer management, compute pipelines, `initGPU()`, `runFIM()`, `readResults()`.
+- `static/js/rothermel.js` — CPU Rothermel implementation (reference/fallback).
+- `static/js/fuel_models.js` — Fuel model parsing (Anderson 13 / Scott-Burgan 40).
+- `static/js/fire_2D_map.js` — Canvas visualization, Google Maps overlay, animation, editing tools.
+- `static/js/shaders/*.wgsl` — WebGPU compute shaders (see below).
+- `fire_sim_lib/` — C++/CUDA simulator submodule. Only BD (Burn Distance) model is used.
+
+### Compute shaders
+
+| Shader | Purpose |
+|--------|---------|
+| `rothermel.wgsl` | Full Rothermel model on GPU — spread rates, burn distances, crown params (10 bindings) |
+| `fim_solve.wgsl` | FIM Eikonal solver — convergence-based wavefront fire propagation (7 bindings) |
+| `compact_active.wgsl` | Atomic-append compaction of active cells + indirect dispatch args |
+| `burn_dist.wgsl` | Legacy fixed-timestep BD propagation (replaced by FIM, kept for reference) |
+| `accelerate.wgsl` | ROS acceleration toward maximum (BD path only) |
+| `crown_rate.wgsl` | Crown fire escalation (BD path only) |
+
+### Buffer layout conventions
+
+- Spread rates: SoA — `rate[dir * simSize + cell]` (not AoS)
+- Per-cell scalars packed as `vec4<f32>`: `[intensity_modifier, acc_const, I_o, RAC]`
+- Ignition times: `atomic<u32>` with IEEE 754 bitcast for float atomics
+- Burn distances: `f16` when `shader-f16` available, `f32` fallback (shader patched at load time)
 
 ### Data formats
 
-- Output CSV: 8-line metadata header (bounding coords, grid dimensions, max/notset values) followed by comma-separated grid rows.
-- Fire cell values: integer ignition timestamps; -1 = before start, 0 = not burning, 1 = burning.
-- Vegetation values: integer fuel/cover type codes.
-- Working data directory: `static/data/` (current simulation files and `existing/` archived datasets).
+- `.fmd`: Fuel model definitions (13 tokens per line: model# + 12 parameters)
+- `.fms`: Fuel moisture (6 tokens per line: model# + 5 moisture percentages)
+- `.asc`/`.fuel`: ASC grid format (key-value header + space-separated grid)
+- Fire CSV: 8-line header (bounding coords, dims, notsetfire sentinel) + comma-separated grid
+- Terrain `.bin`: raw Float32Array (3 floats per cell: slope, aspect, elevation)
 
-### Resolution mapping
+### Grid dimensions
 
-DEM terrain grid is 642x906; vegetation grid is 203x287. `util.py:fit_high_resolution_into_low()` handles conversion between these scales.
+Default: 906 columns × 642 rows = 581,652 cells. Cell size: 30m. Vegetation grid (203×287) upsampled to match via `util.py:fit_high_resolution_into_low()`.
 
-## API Endpoints (summary)
+## API Endpoints
 
 | Method | Route | Purpose |
 |--------|-------|---------|
+| GET | `/api/sim_data_manifest` | Input file paths + grid dimensions (supports `?mode=synthetic`) |
 | GET | `/api/veg_data` | Vegetation grid |
-| GET | `/api/fire_data` | Full fire results |
+| GET | `/api/fire_data` | Full fire results (server path) |
 | GET | `/api/fire_data/metadata` | Bounding coords + dimensions |
 | GET | `/api/fire_frame_data/<start>/<end>` | Time-sliced fire data |
 | POST | `/api/update_veg_file` | Update vegetation, re-run sim |
 | POST | `/api/update_fire_file` | Update fire locations, re-run sim |
-| POST | `/api/update_fire_info` | Update fire info from UI |
 | GET | `/fire_vis/<folder_name>` | Load existing dataset |
 
-Wind variants append `/<wind_x>/<wind_y>` to update/upload routes.
+## Documentation
+
+- `README.org` — Project overview, model description, parameters, architecture
+- `WEBGPU.org` — CUDA-to-WebGPU porting details, shader documentation, buffer layouts
+- `OPTIMIZE.org` — Performance optimization history with measurements
