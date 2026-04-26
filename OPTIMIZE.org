@@ -126,7 +126,7 @@ prefix sum, (2) BurnDist/Accelerate/Crown read from the compacted index.
 Complexity: high. Prefix-sum on GPU is well-studied but adds implementation
 weight. Only worthwhile if the active fraction is <20% of total cells.
 
-* Phase 2: Algorithmic Improvements [0/4]
+* Phase 2: Algorithmic Improvements [1/4]
 
 Expected speedup: *5–50×* depending on landscape. Fundamental changes to how
 the simulation advances.
