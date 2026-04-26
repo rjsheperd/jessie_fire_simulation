@@ -252,15 +252,15 @@ async function runWebGPUSimulation() {
         });
         console.log('WebGPU: GPU Rothermel + init complete in %.1f ms', performance.now() - rothT0);
 
-        console.log('WebGPU: Running simulation (%d steps, timestep=%f)...', manifest.step_count, webgpuSim.timestep);
+        console.log('WebGPU: Running FIM simulation (max %d iterations)...', webgpuSim.simRows + webgpuSim.simCols);
         const startTime = performance.now();
-        await webgpuSim.run(manifest.step_count, true, function(done, total) {
-            if (done % 100 === 0 || done === total) {
-                console.log('WebGPU: Step %d/%d', done, total);
+        await webgpuSim.runFIM(function(done, total) {
+            if (done % 256 === 0 || done === total) {
+                console.log('WebGPU FIM: Iteration batch %d/%d', done, total);
             }
         });
         const elapsed = performance.now() - startTime;
-        console.log('WebGPU: Simulation complete in %.1f ms', elapsed);
+        console.log('WebGPU: FIM simulation complete in %.1f ms', elapsed);
 
         // Read results back
         const toaMap = await webgpuSim.readResults();

@@ -210,6 +210,26 @@ class FireSimWebGPU {
         });
         // Initialize to 0.0
         device.queue.writeBuffer(this.maxSpreadAtomicBuf, 0, new Uint32Array([0]));
+
+        // FIM ping-pong: second active list + counter + indirect args
+        this.fimActiveListB = device.createBuffer({
+            size: simSize * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.fimCountB = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        });
+        this.fimIndirectB = device.createBuffer({
+            size: 12,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT,
+        });
+
+        // FIM params uniform
+        this.fimParamsBuf = device.createBuffer({
+            size: 32,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
     }
 
     async _runRothermelGPU(data) {
@@ -315,6 +335,7 @@ class FireSimWebGPU {
         var maxSpread = dv.getFloat32(0, true);
 
         this.timestep = maxSpread > 0 ? maxSpread / data.cellSize : 1.0;
+        this.cellSize = data.cellSize;
         console.log('GPU Rothermel: maxSpread=%.4f, timestep=%.4f', maxSpread, this.timestep);
 
         // Clean up input-only buffers
@@ -481,11 +502,12 @@ class FireSimWebGPU {
     async _createPipelines() {
         const device = this.device;
 
-        var [burnDistSrc, accelSrc, crownSrc, compactSrc] = await Promise.all([
+        var [burnDistSrc, accelSrc, crownSrc, compactSrc, fimSrc] = await Promise.all([
             this._loadShader('/static/js/shaders/burn_dist.wgsl'),
             this._loadShader('/static/js/shaders/accelerate.wgsl'),
             this._loadShader('/static/js/shaders/crown_rate.wgsl'),
             this._loadShader('/static/js/shaders/compact_active.wgsl'),
+            this._loadShader('/static/js/shaders/fim_solve.wgsl'),
         ]);
 
         // If f16 not supported, patch the shader to use f32 for burn_dist
@@ -529,6 +551,15 @@ class FireSimWebGPU {
             layout: 'auto',
             compute: {
                 module: device.createShaderModule({ code: crownSrc }),
+                entryPoint: 'main',
+            },
+        });
+
+        // FIM solver pipeline
+        this.fimPipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: device.createShaderModule({ code: fimSrc }),
                 entryPoint: 'main',
             },
         });
@@ -606,6 +637,34 @@ class FireSimWebGPU {
                 { binding: 1, resource: { buffer: this.maxSpreadRateBuf } },
                 { binding: 2, resource: { buffer: this.packedScalarsBuf } },
                 { binding: 3, resource: { buffer: this.crownParamsBuf } },
+            ],
+        });
+
+        // FIM bind groups — ping-pong: A reads activeIndices→fimActiveListB, B reads B→A
+        // Variant A: active_in = activeIndicesBuf, active_out = fimActiveListB
+        this.fimBindGroupA = device.createBindGroup({
+            layout: this.fimPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.ignTimeBufA } },
+                { binding: 1, resource: { buffer: this.maxSpreadRateBuf } },
+                { binding: 2, resource: { buffer: this.activeIndicesBuf } },
+                { binding: 3, resource: { buffer: this.fimActiveListB } },
+                { binding: 4, resource: { buffer: this.fimCountB } },
+                { binding: 5, resource: { buffer: this.fimIndirectB } },
+                { binding: 6, resource: { buffer: this.fimParamsBuf } },
+            ],
+        });
+        // Variant B: active_in = fimActiveListB, active_out = activeIndicesBuf
+        this.fimBindGroupB = device.createBindGroup({
+            layout: this.fimPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.ignTimeBufA } },
+                { binding: 1, resource: { buffer: this.maxSpreadRateBuf } },
+                { binding: 2, resource: { buffer: this.fimActiveListB } },
+                { binding: 3, resource: { buffer: this.activeIndicesBuf } },
+                { binding: 4, resource: { buffer: this.activeCountBuf } },
+                { binding: 5, resource: { buffer: this.indirectArgsBuf } },
+                { binding: 6, resource: { buffer: this.fimParamsBuf } },
             ],
         });
     }
@@ -712,6 +771,87 @@ class FireSimWebGPU {
         this.timing.run_ms = performance.now() - t0;
     }
 
+    // Fast Iterative Method — replaces run() with convergence-based wavefront expansion.
+    // Uses pre-computed max_spread_rate from Rothermel to solve arrival times directly.
+    // Self-terminates when no new cells are reached (indirect dispatch of 0 workgroups).
+    async runFIM(onProgress) {
+        var t0 = performance.now();
+        const device = this.device;
+        const simSize = this.simSize;
+        const cellWorkgroups = Math.ceil(simSize / 256);
+        const cellSize = this.cellSize;
+
+        // Write FIM params uniform
+        var fimParams = new ArrayBuffer(32);
+        var fimU32 = new Uint32Array(fimParams, 0, 4);
+        var fimF32 = new Float32Array(fimParams);
+        fimU32[0] = simSize;
+        fimU32[1] = this.simRows;
+        fimU32[2] = this.simCols;
+        fimU32[3] = 0;
+        fimF32[4] = cellSize;
+        fimF32[5] = cellSize * Math.SQRT2;
+        fimF32[6] = 0;
+        fimF32[7] = 0;
+        device.queue.writeBuffer(this.fimParamsBuf, 0, fimParams);
+
+        // Conservative upper bound: wavefront can traverse at most the grid diagonal
+        var maxIter = this.simRows + this.simCols;
+        var BATCH = 256;
+
+        // Step 1: compact_active builds initial active list from ignited cells
+        var encoder = device.createCommandEncoder();
+        encoder.clearBuffer(this.activeCountBuf, 0, 4);
+        encoder.clearBuffer(this.indirectArgsBuf, 0, 12);
+        var compactPass = encoder.beginComputePass();
+        compactPass.setPipeline(this.compactPipeline);
+        compactPass.setBindGroup(0, this.compactBindGroupA);
+        compactPass.dispatchWorkgroups(cellWorkgroups);
+        compactPass.end();
+
+        // Step 2: FIM iterations — alternate ping-pong bind groups
+        // Even iterations: A reads activeIndicesBuf → writes fimActiveListB (dispatch via indirectArgsBuf)
+        // Odd iterations:  B reads fimActiveListB → writes activeIndicesBuf (dispatch via fimIndirectB)
+        for (var i = 0; i < maxIter; i++) {
+            if (i % 2 === 0) {
+                // Clear output (B side) counter and indirect
+                encoder.clearBuffer(this.fimCountB, 0, 4);
+                encoder.clearBuffer(this.fimIndirectB, 0, 12);
+                var pass = encoder.beginComputePass();
+                pass.setPipeline(this.fimPipeline);
+                pass.setBindGroup(0, this.fimBindGroupA);
+                pass.dispatchWorkgroupsIndirect(this.indirectArgsBuf, 0);
+                pass.end();
+            } else {
+                // Clear output (A side) counter and indirect
+                encoder.clearBuffer(this.activeCountBuf, 0, 4);
+                encoder.clearBuffer(this.indirectArgsBuf, 0, 12);
+                var pass = encoder.beginComputePass();
+                pass.setPipeline(this.fimPipeline);
+                pass.setBindGroup(0, this.fimBindGroupB);
+                pass.dispatchWorkgroupsIndirect(this.fimIndirectB, 0);
+                pass.end();
+            }
+
+            // Submit in batches to avoid oversized command buffers
+            if ((i + 1) % BATCH === 0 || i === maxIter - 1) {
+                device.queue.submit([encoder.finish()]);
+                if (onProgress) {
+                    onProgress(Math.min(i + 1, maxIter), maxIter);
+                }
+                if (i < maxIter - 1) {
+                    encoder = device.createCommandEncoder();
+                }
+            }
+        }
+
+        await device.queue.onSubmittedWorkDone();
+
+        // FIM writes arrival times to ignTimeBufA — ensure readResults reads from A
+        this._pingPong = 0;
+        this.timing.run_ms = performance.now() - t0;
+    }
+
     async readResults() {
         var t0 = performance.now();
         const device = this.device;
@@ -747,6 +887,10 @@ class FireSimWebGPU {
         if (this.stagingBuf) this.stagingBuf.destroy();
         if (this.maxSpreadAtomicBuf) this.maxSpreadAtomicBuf.destroy();
         if (this.maxSpreadStagingBuf) this.maxSpreadStagingBuf.destroy();
+        if (this.fimActiveListB) this.fimActiveListB.destroy();
+        if (this.fimCountB) this.fimCountB.destroy();
+        if (this.fimIndirectB) this.fimIndirectB.destroy();
+        if (this.fimParamsBuf) this.fimParamsBuf.destroy();
         this.device = null;
     }
 }
