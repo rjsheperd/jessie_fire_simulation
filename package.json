@@ -1,0 +1,24 @@
+{
+  "name": "jessie_fire_simulation",
+  "version": "1.0.0",
+  "description": "This is a server for Jessie fire simulation in the backend. Andy and Chase are in charge of Unity part. Rui is in charge of python server part and the front-end simulation visualization.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rjsheperd/jessie_fire_simulation.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/rjsheperd/jessie_fire_simulation/issues"
+  },
+  "homepage": "https://github.com/rjsheperd/jessie_fire_simulation#readme",
+  "dependencies": {
+    "playwright": "^1.59.1"
+  }
+}

@@ -167,7 +167,7 @@ def update_onfire_file(fire_file, fire_arr):
     return 'success'
 
 def update_veg_file(veg_file,meta_data,veg_2D_grid):
-    fp = open(veg_file, 'wb')
+    fp = open(veg_file, 'w')
     # write meta data
     for item in meta_data:
         item.append('\n')
@@ -193,7 +193,7 @@ def fit_high_resolution_into_low(high_rows,high_cols,low_rows,low_cols,cur_row,c
     return aim_row,aim_col
 
 def update_on_fire_file(fire_file,fire_2D_grid):
-    fp = open(fire_file, 'wb')
+    fp = open(fire_file, 'w')
     # write meta data
     # I hard coded here to write metadata
     fp.write('left_top_lat:61.8819050\n')
@@ -232,17 +232,17 @@ def update_on_fire_file(fire_file,fire_2D_grid):
                         temp_row, temp_col = fit_high_resolution_into_low(dem_rows,dem_cols,veg_rows,veg_cols,r,c)
                         # if the cell is 2 set fire by users
                         if temp_row==row and temp_col==col:
-                            print 'row is:'+str(r)+'; col is:'+str(c)+'; temp_row is:'+str(temp_row)+'; temp_col is:'+str(temp_col)
+                            print('row is:'+str(r)+'; col is:'+str(c)+'; temp_row is:'+str(temp_row)+'; temp_col is:'+str(temp_col))
                             if final_fire_2D_grid[r][c] != 1:
                                 final_fire_2D_grid[r][c] = 1
 
-    print count
+    print(count)
     for r in range(dem_rows):
         for c in range(dem_cols):
             if final_fire_2D_grid[r][c] == 1:
-                print 'row is:'+str(r)+'; col is:'+str(c)+';'
+                print('row is:'+str(r)+'; col is:'+str(c)+';')
                 count1 = count1 + 1
-    print count1
+    print(count1)
 
 
 
@@ -327,7 +327,7 @@ def execute(directory, command, log_path=None, err_log_path=None):
     https://github.com/VirtualWatershed/vw-py/blob/master/vwpy/prms_runner.py
     '''
     if not log_path:
-        print 'NO log file provided!'
+        print('NO log file provided!')
         #log_path = '/dev/null'
     if not os.path.exists(os.path.dirname(log_path)):
         os.makedirs(os.path.dirname(log_path))
@@ -351,7 +351,10 @@ def exec_model(wind_x='0',wind_y='0'):
     data_folder = app_root + '/static/data'
     command = ['./simulator',data_folder+'/temp_upload_fuel',data_folder+'/temp_upload_onfire',data_folder+'/temp_final_tests.csv',wind_x,wind_y]
     exec_dir = app_root + '/../firesim/build/'
-    execute(exec_dir, command, log_path, err_log_path)
+    try:
+        execute(exec_dir, command, log_path, err_log_path)
+    except Exception as e:
+        print('exec_model failed (CUDA simulator not available, WebGPU will handle client-side): ' + str(e))
 
 
 # def line_prepender(filename, line):

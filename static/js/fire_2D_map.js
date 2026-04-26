@@ -74,14 +74,14 @@ $(document).ready(function(){
   var onFireCell = [];
 
 
-  $.get('/api/fire_data', function(data){
-
-    inputJson = JSON.parse(data);
+  // Try WebGPU first, fall back to server-side simulation
+  function initWithData(inputJsonData) {
+    inputJson = inputJsonData;
 
     // grab col and row num
     dataX = inputJson['num_cols'];
     dataY = inputJson['num_rows'];
-    
+
     fireOrigin = inputJson["fire_data"].slice();
     onFireCell = inputJson["fire_data"].slice();
 
@@ -98,7 +98,7 @@ $(document).ready(function(){
 
     canvasSize.push(canvasWidth);
     canvasSize.push(canvasHeight);
-   
+
     $('.mapCanvas').attr('width',canvasWidth.toString()+'px');
     $('.mapCanvas').attr('height',canvasHeight.toString()+'px');
 
@@ -140,10 +140,26 @@ $(document).ready(function(){
 
       });
     });
-    
+  }
 
-
-  });
+  // Attempt WebGPU simulation, fall back to server-side
+  if (typeof runWebGPUSimulation === 'function') {
+    runWebGPUSimulation().then(function(result) {
+      if (result) {
+        console.log('Using WebGPU simulation results');
+        initWithData(result);
+      } else {
+        console.log('Falling back to server-side simulation');
+        $.get('/api/fire_data', function(data) {
+          initWithData(JSON.parse(data));
+        });
+      }
+    });
+  } else {
+    $.get('/api/fire_data', function(data) {
+      initWithData(JSON.parse(data));
+    });
+  }
 
 
 
@@ -171,7 +187,7 @@ $(document).ready(function(){
   }
   // TODO, cannot use url to get google map image based on the two corners
   function setupBackgroundMap()
-  {veg2DGrid[tempRow][tempCol] = value1.colorNum
+  {
     // backgroundMap.onload = function(){
     //   canvas2DContext.globalAlpha = 0.5;
     //   canvas2DContext.drawImage(backgroundMap, 0, 0);
@@ -348,6 +364,24 @@ $(document).ready(function(){
     });
 
   $("#post-veg-update").click(function(){
+    // Try WebGPU re-simulation first
+    if (webgpuSimEnabled && typeof rerunWebGPUSimulation === 'function') {
+      currentTime = 0;
+      rerunWebGPUSimulation(null, veg2DGrid).then(function(result) {
+        if (result) {
+          inputJson = result;
+          fireCurrent = result.fire_data.slice();
+          $('#startButtonID').trigger("click");
+        } else {
+          _postVegUpdateToServer();
+        }
+      });
+    } else {
+      _postVegUpdateToServer();
+    }
+  });
+
+  function _postVegUpdateToServer() {
     // post the update info back to server
     var wind_x = $('#wind_x').val().toString();
     var wind_y = $('#wind_y').val().toString();
@@ -370,8 +404,7 @@ $(document).ready(function(){
 
         }
     });
-
-  });
+  }
 
 
     // TODO send changes back to server
@@ -405,6 +438,24 @@ $(document).ready(function(){
 
   // TODO need to merge fire update and veg post
   $("#post-fire-update").click(function(){
+    // Try WebGPU re-simulation first
+    if (webgpuSimEnabled && typeof rerunWebGPUSimulation === 'function') {
+      currentTime = 0;
+      rerunWebGPUSimulation(onFireCell, null).then(function(result) {
+        if (result) {
+          inputJson = result;
+          fireCurrent = result.fire_data.slice();
+          $('#startButtonID').trigger("click");
+        } else {
+          _postFireUpdateToServer();
+        }
+      });
+    } else {
+      _postFireUpdateToServer();
+    }
+  });
+
+  function _postFireUpdateToServer() {
     var wind_x = $('#wind_x').val().toString();
     var wind_y = $('#wind_y').val().toString();
     // post the update info back to server
@@ -426,8 +477,7 @@ $(document).ready(function(){
 
         }
     });
-
-  });
+  }
 
 
     // TODO send changes back to server

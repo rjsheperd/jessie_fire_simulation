@@ -1,0 +1,262 @@
+#+TITLE: Port CUDA Fire Simulation to WebGPU
+#+AUTHOR: RJ Sheperd
+#+DATE: 2026-04-25
+
+* Context
+
+The fire simulation currently runs as a C++ CUDA binary (~fire_sim_lib/build/simulator~) invoked server-side via Python subprocess. The browser sends data to Flask, Flask writes input files, runs the simulator, reads the output CSV, and returns JSON. This requires a CUDA-capable GPU on the server and adds a full network round-trip for every simulation run.
+
+Porting to WebGPU moves the entire simulation into the browser. The user gets instant feedback when editing fire/vegetation parameters, no server GPU is needed, and the architecture becomes much simpler.
+
+The BD (Burn Distance) model is the only one used in production (~simulation.cu:54~ creates a ~BD~ instance). MT and IMT are not wired into the Flask server. This plan ports BD only.
+
+* Phase 0: Server-Side Binary Data Endpoint
+
+** Goal
+
+Replace GDAL file parsing with a Flask endpoint that serves pre-processed simulation inputs as a flat binary blob the browser can load directly into GPU buffers.
+
+** Why
+
+GDAL (used in ~FireSim.cpp~ to read ~.tif~ and ~.asc~ files) cannot run in the browser. The server already has all the data files; it just needs to serve them in a GPU-friendly format instead of running the simulator itself.
+
+** New endpoint: ~GET /api/sim_data_binary~
+
+Add to ~views.py~. Returns a binary response containing flat typed arrays (using Python ~struct.pack~):
+
+| Field                  | Type              | Size         | Notes                                                             |
+|------------------------+-------------------+--------------+-------------------------------------------------------------------|
+| Header                 | mixed             | 32 bytes     | rows (642), cols (906), cell_size, foliar_moisture, num_fuel_models |
+| Fuel type grid         | int32[582252]     | 2.2 MB       | From ~.fuel~ file, upsampled 203x287 → 906x642 matching GDAL RasterIO |
+| Slope/aspect/elevation | float32[582252*3] | 7.0 MB       | From ~fixed2.tif~ — 3 bands packed flat (not spatial upsampling)  |
+| Wind X                 | int32[582252]     | 2.2 MB       | From ~.asc~/.fuel~ wind files                                    |
+| Wind Y                 | int32[582252]     | 2.2 MB       |                                                                   |
+| Fire ignition          | int32[582252]     | 2.2 MB       | From 8-header-line CSV; 32767=no fire, 1=ignition                |
+| Canopy height          | float32[582252]   | 2.2 MB       |                                                                   |
+| I_o (precomputed)      | float32[582252]   | 2.2 MB       | ~pow(0.01 * cbh * (460 + 25.9 * foliar_moisture), 1.5)~         |
+| RAC (precomputed)      | float32[582252]   | 2.2 MB       | ~3.0 / cbd~                                                     |
+| Fuel models            | float32[~1500]    | ~6 KB        | ~30 models × ~50 floats (vec4-packed Rothermel coefficients)     |
+| Fuel moisture          | float32[150]      | 600 B        | 30 × 5 floats                                                   |
+| Metadata               | JSON              | ~200 B       | Bounding coordinates for output/Google Maps overlay              |
+
+** Implementation
+
+Use ~rasterio~ (Python GDAL binding) for ~.tif~ reading, manual ~.asc~ parser for ASCII grids, existing text parsers for ~.fmd~/.fms~.
+
+Note from ~FireSim.cpp:201~: terrain file ~fixed2.tif~ is read at ~sim_dim_x_*3~ width — this means 3 bands packed into a flat array, not spatial upsampling. The server endpoint must replicate this exact behavior.
+
+** Files to modify
+
+- ~views.py~ — add endpoint
+- ~util.py~ — add ~serialize_sim_data_binary()~ function
+
+* Phase 1: Rothermel Precomputation in JavaScript
+
+** Goal
+
+Port ~FireSim::UpdateSpreadData()~ and the 16-direction spread rate decomposition to JS. This produces the ~maxspreadrate~, ~curspreadrate~, ~intensity_modifier~, and ~acceleration_constant~ arrays that the GPU kernels consume.
+
+** Why
+
+The CUDA version also runs Rothermel on CPU before uploading to GPU (~propagation.cu:69~ calls ~simulation_->UpdateSpreadData()~, then lines 76-97 decompose into 16 directions). It's a one-time precomputation with heavy branching and per-fuel-model lookups — natural for CPU, awkward for GPU.
+
+** New files
+
+- ~static/js/fuel_models.js~ — Port ~FuelModel~ constructor (~FuelModel.h:29-231~) and parsers
+- ~static/js/rothermel.js~ — Port ~UpdateSpreadData()~ (~FireSim.cpp:351-668~) and the 16-direction decomposition (~propagation.cu:73-97~)
+
+** Key formula
+
+From ~propagation.cu:82-84~:
+
+#+begin_src
+maxspreadrate[cell*16+i] = roth_data[row][col].x * (1 - roth_data[row][col].z) /
+    (1 - roth_data[row][col].z * cos(roth_data[row][col].y * PI/180 - angles[i]))
+#+end_src
+
+Where:
+#+begin_src
+angles[16] = {90, 45, 0, -45, -90, -115, 180, 115,
+              63.4349, 26.5651, -26.5651, -63.4349,
+              -116.5651, -153.4349, 153.4349, 116.5651}
+#+end_src
+
+** Output
+
+~Float32Array~ buffers ready for GPU upload (~112 MB total).
+
+** Verification
+
+Compare JS Rothermel output against C++ output for the same input data. Values should match to float32 precision (~6 decimal digits).
+
+* Phase 2: WebGPU Compute Shaders
+
+** Goal
+
+Port the four CUDA kernels to WGSL and orchestrate them from JavaScript.
+
+** Shader 1: ~burn_dist.wgsl~ (from ~kernel_BD.cu:11-85~)
+
+The core fire propagation kernel. For each burning cell, reduces burn distance to 8 neighbors by ~ROS * timestep~. When distance <= 0, ignites the neighbor.
+
+*** Atomics challenge
+
+The CUDA kernel uses ~atomicExch(float)~ on ~ignTimeOut[ncell]~ (line 75). WebGPU only supports atomics on ~u32~/~i32~. Solution: declare ~ign_time_out~ as ~array<atomic<u32>>~, bitcast floats to u32, use a compare-and-swap loop for atomic minimum:
+
+#+begin_src wgsl
+fn atomic_min_float(ptr: ptr<storage, atomic<u32>, read_write>, new_val: f32) {
+    let new_bits = bitcast<u32>(new_val);
+    loop {
+        let old_bits = atomicLoad(ptr);
+        let old_val = bitcast<f32>(old_bits);
+        if (old_val <= new_val) { break; }
+        let result = atomicCompareExchangeWeak(ptr, old_bits, new_bits);
+        if (result.exchanged) { break; }
+    }
+}
+#+end_src
+
+This is actually *more correct* than the CUDA code, which has a race window between the two ~atomicExch~ calls at lines 74-79 where a third thread could clobber the value.
+
+*** Neighbor indexing (preserved from CUDA)
+
+#+begin_src
+nCol[8] = {0, 1, 1, 1, 0, -1, -1, -1}
+nRow[8] = {1, 1, 0, -1, -1, -1, 0, 1}
+distCell = cell * 8
+rothCell = cell * 16
+#+end_src
+
+BD uses 8 neighbors for burn distance but indexes into 16-direction spread rates.
+
+** Shader 2: ~copy_kernel.wgsl~ (from ~kernel_BD.cu:91-96~)
+
+Trivial ping-pong: ~ign_time_in[cell] = atomicLoad(ign_time_out[cell])~. Needed because BurnDist reads ~ign_time_in~ and writes ~ign_time_out~.
+
+** Shader 3: ~accelerate.wgsl~ (from ~kernel_common.cu:8-29~)
+
+Each thread handles one cell's 16 directions. Accelerates ~curspreadrate~ toward ~maxspreadrate~ using ~log()~. Note the stride: ~cell = gid * 16~, advancing by ~stride * 16~ (line 10, 26).
+
+** Shader 4: ~crown_rate.wgsl~ (from ~kernel_common.cu:36-64~)
+
+Crown fire escalation. Uses ~exp()~ and ~log()~, both available in WGSL. Checks if fire intensity exceeds canopy critical threshold, then escalates spread rate.
+
+** JS Orchestration: ~static/js/webgpu_sim.js~
+
+#+begin_src javascript
+class FireSimWebGPU {
+    async init(device, binaryData)  // parse binary blob, create buffers & pipelines
+    async run(stepCount = 600)      // dispatch 4 compute passes per step, 600 times
+    async readResults()             // map staging buffer, return Float32Array of TOA
+}
+#+end_src
+
+** Per-timestep dispatch order
+
+Matching ~BD::RunKernel~ at ~BD.cu:97-118~:
+
+1. ~BurnDist~ — fire propagation
+2. ~copyKernelBD~ — ping-pong swap
+3. ~TestCrownRate~ — crown fire (conditional)
+4. ~Accelerate~ — ROS acceleration
+5. Update ~current_time~ uniform (~+= timestep~)
+
+Workgroup size: 256 threads, ~ceil(582252 / 256) = 2275~ workgroups.
+
+** Buffer sizes
+
+| Buffer            | Size    | Notes                      |
+|-------------------+---------+----------------------------|
+| ign_time_in       | 2.2 MB  | f32 × 582252              |
+| ign_time_out      | 2.2 MB  | atomic<u32> × 582252      |
+| burn_dist         | 18.6 MB | f32 × 582252 × 8          |
+| max_spread_rate   | 37.3 MB | f32 × 582252 × 16         |
+| cur_spread_rate   | 37.3 MB | f32 × 582252 × 16         |
+| intensity_modifier | 2.2 MB | f32 × 582252              |
+| I_o, RAC, acc_const | 2.2 MB each | f32 × 582252         |
+| l_n               | 64 B    | f32 × 16                  |
+| params uniform    | 32 B    | size, rows, cols, timestep, t |
+| *Total*           | *~108 MB* | Well within WebGPU limits |
+
+** New files
+
+- ~static/js/webgpu_sim.js~
+- ~static/js/shaders/burn_dist.wgsl~
+- ~static/js/shaders/copy_kernel.wgsl~
+- ~static/js/shaders/accelerate.wgsl~
+- ~static/js/shaders/crown_rate.wgsl~
+
+* Phase 3: Frontend Integration
+
+** Goal
+
+Wire the WebGPU simulation into the existing animation and editing UI.
+
+** Data flow change
+
+#+begin_src
+Before: Browser → Flask → subprocess(./simulator) → CSV → JSON API → Canvas
+After:  Browser → Flask(/api/sim_data_binary) → WebGPU compute → Float32Array → Canvas
+#+end_src
+
+** Modify ~static/js/fire_2D_map.js~
+
+- On page load: fetch ~/api/sim_data_binary~, run Rothermel in JS, run WebGPU simulation
+- Store results as ~fireCurrent[642][906]~ in the same string format the existing ~updateCanvas()~ expects
+- All existing animation code (the ~setInterval(updateCanvas, 10)~ loop, Google Maps overlay, interactive editing) remains unchanged
+
+** Modify ~templates/fire_vis.html~
+
+Add ~<script>~ tags for ~webgpu_sim.js~, ~rothermel.js~, ~fuel_models.js~.
+
+** Fallback
+
+If ~!navigator.gpu~, fall back to the existing server-side path (~GET /api/fire_data~). The Flask subprocess flow continues to work as-is.
+
+* Phase 4: Interactive Re-simulation
+
+** Goal
+
+When users modify vegetation or fire points, re-run the simulation client-side without a server round-trip.
+
+** Current flow
+
+User edits → POST to Flask → Flask writes files + runs subprocess → GET results.
+
+** New flow
+
+User edits → modify local ~fuel_type~ / ~ign_time~ arrays in JS → re-run Rothermel (if veg changed) → re-upload buffers → run 600 WebGPU iterations → animate.
+
+Server POST still needed for *persistence* (saving edits), but simulation is instant locally.
+
+* Verification Strategy
+
+** Phase 1 verification
+
+Run the C++ simulator on a test dataset, capture the ~maxspreadrate~ array. Run the JS Rothermel on the same input. Diff the arrays — should match to float32 precision (~6 decimal digits).
+
+** Phase 2 verification
+
+Run the full WebGPU simulation on the same test dataset. Compare the output TOA grid against ~temp_final_tests.csv~. Due to float precision differences and the improved atomics (CAS vs double-atomicExch), expect minor differences (a few timesteps for cells near the fire front). Visually, the fire spread pattern should match.
+
+** Phase 3 verification
+
+Load the same dataset in the browser. The fire animation should look identical to the current server-side version. Test Google Maps overlay still works.
+
+** Cross-browser testing
+
+Chrome 113+, Firefox 121+, Safari 18+ (WebGPU support). Verify the fallback path works on older browsers.
+
+* Risk: Float Atomics
+
+The CUDA BurnDist kernel's atomic pattern (lines 74-79 of ~kernel_BD.cu~) has a subtle race:
+
+#+begin_src cuda
+float old = atomicExch(&ignTimeOut[ncell], step_time);  // Thread A writes
+if(old < step_time) {
+    atomicExch(&ignTimeOut[ncell], old);  // Thread A restores
+    // But Thread B may have written between these two atomicExch calls!
+}
+#+end_src
+
+The WebGPU CAS loop eliminates this race, producing a *more correct* minimum. This means the WebGPU output may differ slightly from CUDA output — but it's actually the better answer.
