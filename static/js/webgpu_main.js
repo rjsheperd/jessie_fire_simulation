@@ -155,148 +155,104 @@ async function runWebGPUSimulation() {
             fireIgn = parseFireIgnition(fireText);
         }
 
-        // Run Rothermel spread computation (parallel via Web Workers if SharedArrayBuffer available)
+        // Pack fuel model data into GPU-friendly layout (13 vec4s per model)
         var rothT0 = performance.now();
-        var useWorkers = typeof SharedArrayBuffer !== 'undefined' && typeof Worker !== 'undefined';
-        var dirRates;
-
-        if (useWorkers) {
-            var numWorkers = Math.min(navigator.hardwareConcurrency || 4, 8);
-            var chunkSize = Math.ceil(SIM_SIZE / numWorkers);
-            console.log('WebGPU: Computing Rothermel spread rates (%d workers, SharedArrayBuffer)...', numWorkers);
-
-            // Copy input data into SharedArrayBuffers for zero-copy worker access
-            var sharedFuelTypes = new SharedArrayBuffer(fuelTypes.byteLength);
-            new Int32Array(sharedFuelTypes).set(fuelTypes);
-            var sharedSlopeAspectElev = new SharedArrayBuffer(slopeAspectElev.byteLength);
-            new Float32Array(sharedSlopeAspectElev).set(slopeAspectElev);
-            var sharedWindField = new SharedArrayBuffer(windField.byteLength);
-            new Float32Array(sharedWindField).set(windField);
-            var sharedFuelSavAccel = new SharedArrayBuffer(bufs.fuel_sav_accel_b.byteLength);
-            new Float32Array(sharedFuelSavAccel).set(bufs.fuel_sav_accel_b);
-
-            // Small bufs are cloned once (fuel-model-indexed, ~100KB total)
-            var bufsSerialized = {};
-            var bufKeys = ['dead_1h_b','dead_10h_b','dead_100h_b','live_h_b','live_w_b',
-                           'dead_sav_burnable_b','fine_dead_ext_density_b','areas_reaction_b',
-                           'slope_wind_b','residence_flux_b','dead_moistures_t','live_moistures_t'];
-            for (var bk = 0; bk < bufKeys.length; bk++) {
-                var key = bufKeys[bk];
-                var src = bufs[key];
-                var sab = new SharedArrayBuffer(src.byteLength);
-                new Float32Array(sab).set(src);
-                bufsSerialized[key] = sab;
-            }
-
-            // Dispatch workers
-            var workerPromises = [];
-            for (var w = 0; w < numWorkers; w++) {
-                var startCell = w * chunkSize;
-                var endCell = Math.min(startCell + chunkSize, SIM_SIZE);
-                if (startCell >= SIM_SIZE) break;
-
-                workerPromises.push(new Promise(function(resolve, reject) {
-                    var worker = new Worker('/static/js/rothermel_worker.js');
-                    worker.onmessage = function(e) {
-                        worker.terminate();
-                        resolve(e.data);
-                    };
-                    worker.onerror = function(e) {
-                        worker.terminate();
-                        reject(e);
-                    };
-                    worker.postMessage({
-                        startCell: startCell,
-                        endCell: endCell,
-                        simCols: SIM_COLS,
-                        simRows: SIM_ROWS,
-                        cellSize: cellSize,
-                        fuelTypesBuf: sharedFuelTypes,
-                        slopeAspectElevBuf: sharedSlopeAspectElev,
-                        windFieldBuf: sharedWindField,
-                        fuelSavAccelBuf: sharedFuelSavAccel,
-                        bufs: bufsSerialized,
-                    });
-                }));
-            }
-
-            // Collect and merge results
-            var workerResults = await Promise.all(workerPromises);
-
-            var maxspreadrate = new Float32Array(SIM_SIZE * 16);
-            var curspreadrate = new Float32Array(SIM_SIZE * 16);
-            var intensityMod = new Float32Array(SIM_SIZE);
-            var accelConst = new Float32Array(SIM_SIZE);
-            var maxSpreadGlobal = 0.0;
-
-            for (var r = 0; r < workerResults.length; r++) {
-                var res = workerResults[r];
-                var rStart = res.startCell;
-                var rEnd = res.endCell;
-                var chunkMaxRate = new Float32Array(res.maxspreadrate);
-                var chunkCurRate = new Float32Array(res.curspreadrate);
-                // SoA layout: copy each direction plane's chunk [dir*SIM_SIZE+start, dir*SIM_SIZE+end)
-                for (var d = 0; d < 16; d++) {
-                    var planeOff = d * SIM_SIZE;
-                    maxspreadrate.set(chunkMaxRate.subarray(planeOff + rStart, planeOff + rEnd), planeOff + rStart);
-                    curspreadrate.set(chunkCurRate.subarray(planeOff + rStart, planeOff + rEnd), planeOff + rStart);
-                }
-                var chunkIM = new Float32Array(res.intensityModifier);
-                intensityMod.set(chunkIM.subarray(rStart, rEnd), rStart);
-                var chunkAC = new Float32Array(res.accelerationConstant);
-                accelConst.set(chunkAC.subarray(rStart, rEnd), rStart);
-                if (res.maxSpread > maxSpreadGlobal) maxSpreadGlobal = res.maxSpread;
-            }
-
-            var ortho = cellSize;
-            var diag = cellSize * Math.SQRT2;
-            var superDist = Math.sqrt(cellSize * cellSize + (2 * cellSize) * (2 * cellSize));
-            var l_n = new Float32Array([
-                ortho, diag, ortho, diag, ortho, diag, ortho, diag,
-                superDist, superDist, superDist, superDist,
-                superDist, superDist, superDist, superDist
-            ]);
-            var timestep = maxSpreadGlobal > 0 ? maxSpreadGlobal / cellSize : 1.0;
-            dirRates = {
-                maxspreadrate: maxspreadrate, curspreadrate: curspreadrate,
-                intensityModifier: intensityMod, accelerationConstant: accelConst,
-                l_n: l_n, timestep: timestep, maxSpread: maxSpreadGlobal,
-            };
-            console.log('WebGPU: Rothermel complete in %.1f ms (%d workers)', performance.now() - rothT0, numWorkers);
-        } else {
-            // Fallback: sequential Rothermel (no SharedArrayBuffer)
-            console.log('WebGPU: Computing Rothermel spread rates (sequential)...');
-            var rothData = updateSpreadData(SIM_COLS, SIM_ROWS, fuelTypes, slopeAspectElev, windField, bufs);
-            dirRates = computeDirectionalRates(SIM_COLS, SIM_ROWS, rothData, fuelTypes, bufs.fuel_sav_accel_b, cellSize);
-            console.log('WebGPU: Rothermel complete in %.1f ms (sequential)', performance.now() - rothT0);
+        var numFuelModels = bufs.fuel_sav_accel_b.length / 2;
+        // FuelModel struct: 13 vec4s = 52 floats per model
+        var fuelModelData = new Float32Array(numFuelModels * 52);
+        for (var fm = 0; fm < numFuelModels; fm++) {
+            var base = fm * 52;
+            // dead_1h (vec4)
+            fuelModelData[base + 0] = bufs.dead_1h_b[fm*4+0];
+            fuelModelData[base + 1] = bufs.dead_1h_b[fm*4+1];
+            fuelModelData[base + 2] = bufs.dead_1h_b[fm*4+2];
+            fuelModelData[base + 3] = bufs.dead_1h_b[fm*4+3];
+            // dead_10h (vec4)
+            fuelModelData[base + 4] = bufs.dead_10h_b[fm*4+0];
+            fuelModelData[base + 5] = bufs.dead_10h_b[fm*4+1];
+            fuelModelData[base + 6] = bufs.dead_10h_b[fm*4+2];
+            fuelModelData[base + 7] = bufs.dead_10h_b[fm*4+3];
+            // dead_100h (vec4)
+            fuelModelData[base + 8] = bufs.dead_100h_b[fm*4+0];
+            fuelModelData[base + 9] = bufs.dead_100h_b[fm*4+1];
+            fuelModelData[base + 10] = bufs.dead_100h_b[fm*4+2];
+            fuelModelData[base + 11] = bufs.dead_100h_b[fm*4+3];
+            // live_h (vec4)
+            fuelModelData[base + 12] = bufs.live_h_b[fm*4+0];
+            fuelModelData[base + 13] = bufs.live_h_b[fm*4+1];
+            fuelModelData[base + 14] = bufs.live_h_b[fm*4+2];
+            fuelModelData[base + 15] = bufs.live_h_b[fm*4+3];
+            // live_w (vec4)
+            fuelModelData[base + 16] = bufs.live_w_b[fm*4+0];
+            fuelModelData[base + 17] = bufs.live_w_b[fm*4+1];
+            fuelModelData[base + 18] = bufs.live_w_b[fm*4+2];
+            fuelModelData[base + 19] = bufs.live_w_b[fm*4+3];
+            // dead_sav_b (vec4)
+            fuelModelData[base + 20] = bufs.dead_sav_burnable_b[fm*4+0];
+            fuelModelData[base + 21] = bufs.dead_sav_burnable_b[fm*4+1];
+            fuelModelData[base + 22] = bufs.dead_sav_burnable_b[fm*4+2];
+            fuelModelData[base + 23] = bufs.dead_sav_burnable_b[fm*4+3];
+            // fded (vec4)
+            fuelModelData[base + 24] = bufs.fine_dead_ext_density_b[fm*4+0];
+            fuelModelData[base + 25] = bufs.fine_dead_ext_density_b[fm*4+1];
+            fuelModelData[base + 26] = bufs.fine_dead_ext_density_b[fm*4+2];
+            fuelModelData[base + 27] = bufs.fine_dead_ext_density_b[fm*4+3];
+            // areas_react (vec4)
+            fuelModelData[base + 28] = bufs.areas_reaction_b[fm*4+0];
+            fuelModelData[base + 29] = bufs.areas_reaction_b[fm*4+1];
+            fuelModelData[base + 30] = bufs.areas_reaction_b[fm*4+2];
+            fuelModelData[base + 31] = bufs.areas_reaction_b[fm*4+3];
+            // slope_wind (vec4)
+            fuelModelData[base + 32] = bufs.slope_wind_b[fm*4+0];
+            fuelModelData[base + 33] = bufs.slope_wind_b[fm*4+1];
+            fuelModelData[base + 34] = bufs.slope_wind_b[fm*4+2];
+            fuelModelData[base + 35] = bufs.slope_wind_b[fm*4+3];
+            // resid_flux (vec4) — only x,y used, pad z,w
+            fuelModelData[base + 36] = bufs.residence_flux_b[fm*4+0];
+            fuelModelData[base + 37] = bufs.residence_flux_b[fm*4+1];
+            fuelModelData[base + 38] = bufs.residence_flux_b[fm*4+2];
+            fuelModelData[base + 39] = bufs.residence_flux_b[fm*4+3];
+            // fuel_sav_acc (vec4) — fuelSAV, accelerationConstant, 0, 0
+            fuelModelData[base + 40] = bufs.fuel_sav_accel_b[fm*2+0];
+            fuelModelData[base + 41] = bufs.fuel_sav_accel_b[fm*2+1];
+            fuelModelData[base + 42] = 0;
+            fuelModelData[base + 43] = 0;
+            // moistures (vec4) — dead1h, dead10h, dead100h, 0
+            fuelModelData[base + 44] = bufs.dead_moistures_t[fm*3+0];
+            fuelModelData[base + 45] = bufs.dead_moistures_t[fm*3+1];
+            fuelModelData[base + 46] = bufs.dead_moistures_t[fm*3+2];
+            fuelModelData[base + 47] = 0;
+            // live_moist (vec4) — liveH, liveW, 0, 0
+            fuelModelData[base + 48] = bufs.live_moistures_t[fm*2+0];
+            fuelModelData[base + 49] = bufs.live_moistures_t[fm*2+1];
+            fuelModelData[base + 50] = 0;
+            fuelModelData[base + 51] = 0;
         }
 
-        // Initialize ignition times and burn distances
-        const ignTimeIn = initIgnitionTimes(SIM_SIZE, fireIgn.data, fireIgn.notsetfire);
-        const burnDist = initBurnDistances(SIM_SIZE, dirRates.l_n);
-
-        // Create and run WebGPU simulation
-        console.log('WebGPU: Initializing GPU...');
-        webgpuSim = new FireSimWebGPU();
-        // Pack per-cell scalars into vec4: [IM, accConst, I_o, RAC]
-        var packedScalars = new Float32Array(SIM_SIZE * 4);
+        // Pack canopy I_o and RAC as interleaved pairs
+        var canopyIoRac = new Float32Array(SIM_SIZE * 2);
         for (var i = 0; i < SIM_SIZE; i++) {
-            packedScalars[i * 4 + 0] = dirRates.intensityModifier[i];
-            packedScalars[i * 4 + 1] = dirRates.accelerationConstant[i];
-            packedScalars[i * 4 + 2] = I_o[i];
-            packedScalars[i * 4 + 3] = RAC[i];
+            canopyIoRac[i * 2 + 0] = I_o[i];
+            canopyIoRac[i * 2 + 1] = RAC[i];
         }
 
-        await webgpuSim.init(SIM_COLS, SIM_ROWS, {
-            ignTimeIn: ignTimeIn,
-            burnDist: burnDist,
-            maxspreadrate: dirRates.maxspreadrate,
-            curspreadrate: dirRates.curspreadrate,
-            packedScalars: packedScalars,
-            timestep: dirRates.timestep,
+        // Run GPU Rothermel + init all simulation buffers on GPU
+        console.log('WebGPU: Initializing GPU + Rothermel...');
+        webgpuSim = new FireSimWebGPU();
+        await webgpuSim.initGPU(SIM_COLS, SIM_ROWS, {
+            fuelModels: fuelModelData,
+            fuelTypes: fuelTypes,
+            slopeAspectElev: slopeAspectElev,
+            windField: windField,
+            fireIgnition: fireIgn.data,
+            canopyIoRac: canopyIoRac,
+            cellSize: cellSize,
+            notsetfire: fireIgn.notsetfire,
+            numFuelModels: numFuelModels,
         });
+        console.log('WebGPU: GPU Rothermel + init complete in %.1f ms', performance.now() - rothT0);
 
-        console.log('WebGPU: Running simulation (%d steps, timestep=%f)...', manifest.step_count, dirRates.timestep);
+        console.log('WebGPU: Running simulation (%d steps, timestep=%f)...', manifest.step_count, webgpuSim.timestep);
         const startTime = performance.now();
         await webgpuSim.run(manifest.step_count, true, function(done, total) {
             if (done % 100 === 0 || done === total) {
@@ -346,6 +302,8 @@ async function runWebGPUSimulation() {
             windField: windField, I_o: I_o, RAC: RAC, cellSize: cellSize,
             bufs: bufs, models: models, moistures: moistures,
             manifest: manifest, fireIgn: fireIgn,
+            fuelModelData: fuelModelData, canopyIoRac: canopyIoRac,
+            numFuelModels: numFuelModels,
         };
 
         webgpuSimEnabled = true;
@@ -395,11 +353,7 @@ async function rerunWebGPUSimulation(fireGrid2D, vegGrid2D) {
             }
         }
 
-        // Recompute Rothermel
-        var rothData = updateSpreadData(c.SIM_COLS, c.SIM_ROWS, fuelTypes, c.slopeAspectElev, c.windField, c.bufs);
-        var dirRates = computeDirectionalRates(c.SIM_COLS, c.SIM_ROWS, rothData, fuelTypes, c.bufs.fuel_sav_accel_b, c.cellSize);
-
-        // Rebuild ignition times
+        // Rebuild ignition data
         var fireData;
         if (fireGrid2D) {
             fireData = new Int32Array(c.SIM_SIZE);
@@ -407,7 +361,6 @@ async function rerunWebGPUSimulation(fireGrid2D, vegGrid2D) {
             for (var row = 0; row < fireGrid2D.length; row++) {
                 for (var col = 0; col < fireGrid2D[row].length; col++) {
                     if (parseInt(fireGrid2D[row][col]) === 2 || parseInt(fireGrid2D[row][col]) === 1) {
-                        // Map from veg grid coords to DEM coords
                         var vegRows = fireGrid2D.length;
                         var vegCols = fireGrid2D[0].length;
                         for (var dr = 0; dr < c.SIM_ROWS; dr++) {
@@ -426,27 +379,18 @@ async function rerunWebGPUSimulation(fireGrid2D, vegGrid2D) {
             fireData = c.fireIgn.data;
         }
 
-        var ignTimeIn = initIgnitionTimes(c.SIM_SIZE, fireData, c.fireIgn.notsetfire);
-        var burnDist = initBurnDistances(c.SIM_SIZE, dirRates.l_n);
-
-        // Run simulation
-        // Pack per-cell scalars into vec4: [IM, accConst, I_o, RAC]
-        var packedScalars = new Float32Array(c.SIM_SIZE * 4);
-        for (var i = 0; i < c.SIM_SIZE; i++) {
-            packedScalars[i * 4 + 0] = dirRates.intensityModifier[i];
-            packedScalars[i * 4 + 1] = dirRates.accelerationConstant[i];
-            packedScalars[i * 4 + 2] = c.I_o[i];
-            packedScalars[i * 4 + 3] = c.RAC[i];
-        }
-
+        // GPU Rothermel re-run
         var sim = new FireSimWebGPU();
-        await sim.init(c.SIM_COLS, c.SIM_ROWS, {
-            ignTimeIn: ignTimeIn,
-            burnDist: burnDist,
-            maxspreadrate: dirRates.maxspreadrate,
-            curspreadrate: dirRates.curspreadrate,
-            packedScalars: packedScalars,
-            timestep: dirRates.timestep,
+        await sim.initGPU(c.SIM_COLS, c.SIM_ROWS, {
+            fuelModels: c.fuelModelData,
+            fuelTypes: fuelTypes,
+            slopeAspectElev: c.slopeAspectElev,
+            windField: c.windField,
+            fireIgnition: fireData,
+            canopyIoRac: c.canopyIoRac,
+            cellSize: c.cellSize,
+            notsetfire: c.fireIgn.notsetfire,
+            numFuelModels: c.numFuelModels,
         });
 
         console.log('WebGPU: Re-running simulation...');

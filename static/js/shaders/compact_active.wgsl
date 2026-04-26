@@ -12,7 +12,7 @@ struct MarkParams {
 @group(0) @binding(0) var<storage, read_write>  ign_time:       array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write>  active_count:   atomic<u32>;       // single counter
 @group(0) @binding(2) var<storage, read_write>  active_indices: array<u32>;        // compacted cell IDs
-@group(0) @binding(3) var<storage, read_write>  indirect_args:  array<u32>;        // [workgroups_x, 1, 1]
+@group(0) @binding(3) var<storage, read_write>  indirect_args:  array<atomic<u32>>; // [workgroups_x, 1, 1]
 @group(0) @binding(4) var<uniform>              params:         MarkParams;
 
 const INF: f32 = 32767.0;
@@ -57,7 +57,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     if (has_unignited_neighbor) {
         // Atomic append: get slot, write cell ID
-        let slot = atomicAdd(&active_count[0u], 1u);
+        let slot = atomicAdd(&active_count, 1u);
         active_indices[slot] = cell;
         // Update indirect dispatch arg (workgroups_x = ceil(count / 256))
         // We write this after every append — wasteful but correct.
