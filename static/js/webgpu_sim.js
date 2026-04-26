@@ -55,6 +55,7 @@ class FireSimWebGPU {
 
     getBufferMemoryUsage() {
         var s = this.simSize;
+        var maskWords = Math.ceil(s / 32);
         return {
             ignTimeA: s * 4,
             ignTimeB: s * 4,
@@ -65,9 +66,10 @@ class FireSimWebGPU {
             accConst: s * 4,
             I_o: s * 4,
             RAC: s * 4,
+            activeMask: maskWords * 4,
             staging: s * 4,
-            uniforms: 68,
-            total: s * (4+4+32+64+64+4+4+4+4+4) + 68,
+            uniforms: 84,
+            total: s * (4+4+32+64+64+4+4+4+4+4) + maskWords * 4 + 84,
         };
     }
 
@@ -80,10 +82,8 @@ class FireSimWebGPU {
         const simSize = this.simSize;
 
         // Dual ignition-time atomic buffers (both are atomic<u32>, no separate f32 buffer)
-        // Buffer A: initialized from ignTimeIn data (bitcast f32 → u32)
         const ignU32A = new Uint32Array(data.ignTimeIn.buffer.slice(0));
         this.ignTimeBufA = this._createStorageBuffer(ignU32A);
-        // Buffer B: initialized identically
         const ignU32B = new Uint32Array(data.ignTimeIn.buffer.slice(0));
         this.ignTimeBufB = this._createStorageBuffer(ignU32B);
 
@@ -100,11 +100,25 @@ class FireSimWebGPU {
         this.ioBuf = this._createStorageBuffer(data.I_o);
         this.racBuf = this._createStorageBuffer(data.RAC);
 
-        // Simulation params uniform — pre-baked with step_index
+        // Active-cell bitmask (1 bit per cell, packed into u32 words)
+        this.maskWords = Math.ceil(simSize / 32);
+        this.activeMaskBuf = device.createBuffer({
+            size: this.maskWords * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // Simulation params uniform
         this.simParamsBuf = device.createBuffer({
-            size: 32, // 8 x f32/u32
+            size: 32,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
+
+        // Mark-active params uniform (size, row_size, col_size, pad)
+        this.markParamsBuf = device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(this.markParamsBuf, 0, new Uint32Array([simSize, this.simRows, this.simCols, 0]));
 
         // Accel params uniform
         this.accelParamsBuf = device.createBuffer({
@@ -117,7 +131,7 @@ class FireSimWebGPU {
             size: 16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        device.queue.writeBuffer(this.crownParamsBuf, 0, new Uint32Array([this.simSize, 0, 0, 0]));
+        device.queue.writeBuffer(this.crownParamsBuf, 0, new Uint32Array([simSize, 0, 0, 0]));
 
         // Staging buffer for readback
         this.stagingBuf = device.createBuffer({
@@ -151,10 +165,11 @@ class FireSimWebGPU {
     async _createPipelines() {
         const device = this.device;
 
-        const [burnDistSrc, accelSrc, crownSrc] = await Promise.all([
+        const [burnDistSrc, accelSrc, crownSrc, markActiveSrc] = await Promise.all([
             this._loadShader('/static/js/shaders/burn_dist.wgsl'),
             this._loadShader('/static/js/shaders/accelerate.wgsl'),
             this._loadShader('/static/js/shaders/crown_rate.wgsl'),
+            this._loadShader('/static/js/shaders/mark_active.wgsl'),
         ]);
 
         // BurnDist pipeline
@@ -162,6 +177,15 @@ class FireSimWebGPU {
             layout: 'auto',
             compute: {
                 module: device.createShaderModule({ code: burnDistSrc }),
+                entryPoint: 'main',
+            },
+        });
+
+        // Mark-active pipeline
+        this.markActivePipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: device.createShaderModule({ code: markActiveSrc }),
                 entryPoint: 'main',
             },
         });
@@ -188,8 +212,8 @@ class FireSimWebGPU {
     _createBindGroups() {
         const device = this.device;
 
-        // BurnDist bind groups — two variants for ping-pong swap
-        // Phase 0: A=read, B=write
+        // BurnDist bind groups — two variants for ping-pong swap, now with active_mask
+        // Variant AB: A=read, B=write
         this.burnDistBindGroupAB = device.createBindGroup({
             layout: this.burnDistPipeline.getBindGroupLayout(0),
             entries: [
@@ -198,9 +222,10 @@ class FireSimWebGPU {
                 { binding: 2, resource: { buffer: this.burnDistBuf } },
                 { binding: 3, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 4, resource: { buffer: this.simParamsBuf } },
+                { binding: 5, resource: { buffer: this.activeMaskBuf } },
             ],
         });
-        // Phase 1: B=read, A=write
+        // Variant BA: B=read, A=write
         this.burnDistBindGroupBA = device.createBindGroup({
             layout: this.burnDistPipeline.getBindGroupLayout(0),
             entries: [
@@ -209,6 +234,27 @@ class FireSimWebGPU {
                 { binding: 2, resource: { buffer: this.burnDistBuf } },
                 { binding: 3, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 4, resource: { buffer: this.simParamsBuf } },
+                { binding: 5, resource: { buffer: this.activeMaskBuf } },
+            ],
+        });
+
+        // Mark-active bind groups — two variants matching which ign_time buffer to read
+        // Variant A: read from buffer A
+        this.markActiveBindGroupA = device.createBindGroup({
+            layout: this.markActivePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.ignTimeBufA } },
+                { binding: 1, resource: { buffer: this.activeMaskBuf } },
+                { binding: 2, resource: { buffer: this.markParamsBuf } },
+            ],
+        });
+        // Variant B: read from buffer B
+        this.markActiveBindGroupB = device.createBindGroup({
+            layout: this.markActivePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.ignTimeBufB } },
+                { binding: 1, resource: { buffer: this.activeMaskBuf } },
+                { binding: 2, resource: { buffer: this.markParamsBuf } },
             ],
         });
 
@@ -246,6 +292,7 @@ class FireSimWebGPU {
         const simSize = this.simSize;
         const workgroups = Math.ceil(simSize / 256);
         const cellWorkgroups = Math.ceil(simSize / 256);
+        const maskWorkgroups = Math.ceil(simSize / 256); // one thread per cell for mark_active
         const timestep = this.timestep;
 
         // Update accel params once (static for the whole run)
@@ -254,18 +301,19 @@ class FireSimWebGPU {
         new Float32Array(accelData, 8, 2).set([timestep, 0]);
         device.queue.writeBuffer(this.accelParamsBuf, 0, accelData);
 
-        // Pre-bake static sim params (everything except step_index)
+        // Pre-bake static sim params (everything except step_index / current_time)
         const paramTemplate = new ArrayBuffer(32);
         const paramU32 = new Uint32Array(paramTemplate);
         const paramF32 = new Float32Array(paramTemplate);
         paramU32[0] = simSize;       // size
         paramU32[1] = this.simRows;  // row_size
         paramU32[2] = this.simCols;  // col_size
-        // paramU32[3] = step_index — updated per step
         paramF32[4] = timestep;      // time_step
-        // paramF32[5] = current_time — computed in shader from step_index * time_step
         paramF32[6] = 0;             // pad
         paramF32[7] = 0;             // pad
+
+        // Zero buffer for clearing the bitmask each step
+        const zeroMask = new Uint32Array(this.maskWords);
 
         // Crown fire frequency: run every CROWN_INTERVAL steps
         const CROWN_INTERVAL = 10;
@@ -277,12 +325,23 @@ class FireSimWebGPU {
             const encoder = device.createCommandEncoder();
 
             for (let s = step; s < batchEnd; s++) {
-                // Update only step_index (4 bytes) — shader computes current_time
+                // Update step_index and current_time
                 paramU32[3] = s;
-                paramF32[5] = s * timestep; // still write current_time for backward compat
+                paramF32[5] = s * timestep;
                 device.queue.writeBuffer(this.simParamsBuf, 0, paramTemplate);
 
-                // Pass 1: BurnDist with ping-pong bind group
+                // Clear the active bitmask to zero before marking
+                device.queue.writeBuffer(this.activeMaskBuf, 0, zeroMask);
+
+                // Pass 0: Mark active cells (reads current read-buffer)
+                var markBG = (this._pingPong === 0) ? this.markActiveBindGroupA : this.markActiveBindGroupB;
+                const pass0 = encoder.beginComputePass();
+                pass0.setPipeline(this.markActivePipeline);
+                pass0.setBindGroup(0, markBG);
+                pass0.dispatchWorkgroups(maskWorkgroups);
+                pass0.end();
+
+                // Pass 1: BurnDist with ping-pong bind group + active mask
                 var burnDistBG = (this._pingPong === 0) ? this.burnDistBindGroupAB : this.burnDistBindGroupBA;
                 const pass1 = encoder.beginComputePass();
                 pass1.setPipeline(this.burnDistPipeline);
@@ -326,12 +385,7 @@ class FireSimWebGPU {
         var t0 = performance.now();
         const device = this.device;
 
-        // Read from whichever buffer was last written to (the "output" of the last step)
-        // After the last swap, _pingPong points to the next read buffer,
-        // which is the one that was just written. But we swapped AFTER BurnDist,
-        // so the current _pingPong's "read" buffer is the last step's output.
-        // _pingPong=0 means A is read → A has the latest data
-        // _pingPong=1 means B is read → B has the latest data
+        // _pingPong=0 means A is read (has latest data), =1 means B is read
         var resultBuf = (this._pingPong === 0) ? this.ignTimeBufA : this.ignTimeBufB;
 
         const encoder = device.createCommandEncoder();
@@ -339,8 +393,6 @@ class FireSimWebGPU {
         device.queue.submit([encoder.finish()]);
 
         await this.stagingBuf.mapAsync(GPUMapMode.READ);
-        // Data is stored as u32 (bitcast of f32), so read as Float32Array directly
-        // since the bit patterns are IEEE 754 floats
         const result = new Float32Array(this.stagingBuf.getMappedRange().slice(0));
         this.stagingBuf.unmap();
         this.timing.readback_ms = performance.now() - t0;
@@ -357,7 +409,9 @@ class FireSimWebGPU {
         if (this.accConstBuf) this.accConstBuf.destroy();
         if (this.ioBuf) this.ioBuf.destroy();
         if (this.racBuf) this.racBuf.destroy();
+        if (this.activeMaskBuf) this.activeMaskBuf.destroy();
         if (this.simParamsBuf) this.simParamsBuf.destroy();
+        if (this.markParamsBuf) this.markParamsBuf.destroy();
         if (this.accelParamsBuf) this.accelParamsBuf.destroy();
         if (this.crownParamsBuf) this.crownParamsBuf.destroy();
         if (this.stagingBuf) this.stagingBuf.destroy();

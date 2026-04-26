@@ -17,6 +17,7 @@ struct SimParams {
 @group(0) @binding(2) var<storage, read_write>  burn_dist:       array<f32>;
 @group(0) @binding(3) var<storage, read>        cur_spread_rate: array<f32>;
 @group(0) @binding(4) var<uniform>              params:          SimParams;
+@group(0) @binding(5) var<storage, read>        active_mask:     array<u32>;
 
 const INF: f32 = 32767.0;
 
@@ -45,6 +46,13 @@ fn atomic_min_float(idx: u32, new_val: f32) {
 fn main(@builtin(global_invocation_id) gid: vec3u) {
     let cell = gid.x;
     if (cell >= params.size) {
+        return;
+    }
+
+    // Early-exit via active-cell bitmask (narrow-band optimization)
+    let mask_word = active_mask[cell / 32u];
+    let mask_bit = 1u << (cell % 32u);
+    if ((mask_word & mask_bit) == 0u) {
         return;
     }
 

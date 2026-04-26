@@ -90,20 +90,19 @@ identical across consecutive steps.
 Files:
 - =static/js/webgpu_sim.js= — add =if (s % 10 === 0)= guard around crown dispatch
 
-* Phase 1: Reduce Redundant Cell Work [0/3]
+* Phase 1: Reduce Redundant Cell Work [1/3]                       :current:
 
 Expected speedup: *2–5×* on top of Phase 0. Skip cells that can't possibly
 change this timestep.
 
-** TODO Active-cell bitmask
+** DONE Active-cell bitmask
 
-Most cells are either unburnable, already burnt, or far from the fire front.
-Only cells near the active front need BurnDist computation.
-
-*Approach:* Maintain a GPU-side bitmask (1 bit per cell, ~71 KB for 581K cells).
-A cell is "active" if it or any neighbor ignited in the last N steps. A
-lightweight prefix kernel updates the bitmask each step. BurnDist skips
-inactive cells via early-exit.
+Implemented =mark_active.wgsl= kernel + bitmask buffer. BurnDist early-exits
+for cells not in the active mask. Result: *neutral on 906×642* (~701ms vs
+678ms) — the mark_active dispatch overhead offsets savings because BurnDist
+already had an =ign_time >= INF= early-exit for unignited cells. The bitmask
+primarily helps skip fully-interior burnt cells, which is a modest fraction
+at this grid size. Infrastructure useful for compacted dispatch (Phase 1.3).
 
 Complexity: medium. Requires an extra kernel and careful bitmask update logic.
 
