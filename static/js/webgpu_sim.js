@@ -296,8 +296,9 @@ class FireSimWebGPU {
         const timestep = this.timestep;
 
         // Update accel params once (static for the whole run)
+        // SoA layout: sim_size is cell count (not * 16)
         const accelData = new ArrayBuffer(16);
-        new Uint32Array(accelData, 0, 2).set([simSize * 16, 0]);
+        new Uint32Array(accelData, 0, 2).set([simSize, 0]);
         new Float32Array(accelData, 8, 2).set([timestep, 0]);
         device.queue.writeBuffer(this.accelParamsBuf, 0, accelData);
 

@@ -334,8 +334,8 @@ function computeDirectionalRates(simCols, simRows, rothData, fuelTypes, fuelSavA
                     const denom = 1.0 - ecc * Math.cos(dir * Math.PI / 180.0 - ANGLES_16[i] * Math.PI / 180.0);
                     rate = msr * (1.0 - ecc) / denom;
                 }
-                maxspreadrate[cellIdx * 16 + i] = rate;
-                curspreadrate[cellIdx * 16 + i] = 0.0;
+                maxspreadrate[i * simSize + cellIdx] = rate;
+                curspreadrate[i * simSize + cellIdx] = 0.0;
                 if (rate > maxSpread) maxSpread = rate;
             }
 

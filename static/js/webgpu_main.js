@@ -234,9 +234,13 @@ async function runWebGPUSimulation() {
                 var rStart = res.startCell;
                 var rEnd = res.endCell;
                 var chunkMaxRate = new Float32Array(res.maxspreadrate);
-                maxspreadrate.set(chunkMaxRate.subarray(rStart * 16, rEnd * 16), rStart * 16);
                 var chunkCurRate = new Float32Array(res.curspreadrate);
-                curspreadrate.set(chunkCurRate.subarray(rStart * 16, rEnd * 16), rStart * 16);
+                // SoA layout: copy each direction plane's chunk [dir*SIM_SIZE+start, dir*SIM_SIZE+end)
+                for (var d = 0; d < 16; d++) {
+                    var planeOff = d * SIM_SIZE;
+                    maxspreadrate.set(chunkMaxRate.subarray(planeOff + rStart, planeOff + rEnd), planeOff + rStart);
+                    curspreadrate.set(chunkCurRate.subarray(planeOff + rStart, planeOff + rEnd), planeOff + rStart);
+                }
                 var chunkIM = new Float32Array(res.intensityModifier);
                 intensityMod.set(chunkIM.subarray(rStart, rEnd), rStart);
                 var chunkAC = new Float32Array(res.accelerationConstant);

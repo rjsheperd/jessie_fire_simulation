@@ -65,9 +65,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
 
     let dist_cell = cell * 8u;
-    let roth_cell = cell * 16u;
     let t = params.current_time;
     let time_step = params.time_step;
+    let sim_size = params.size;
 
     for (var n = 0u; n < 8u; n++) {
         let nrow = row + N_ROW[n];
@@ -85,8 +85,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
             continue;
         }
 
-        // Rate of spread in this direction
-        let ROS = cur_spread_rate[roth_cell + n];
+        // Rate of spread in this direction (SoA layout: [dir * simSize + cell])
+        let ROS = cur_spread_rate[n * sim_size + cell];
 
         // Update burn distance
         var dist = burn_dist[dist_cell + n];
