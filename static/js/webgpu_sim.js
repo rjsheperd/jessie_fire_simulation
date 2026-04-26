@@ -30,7 +30,15 @@ class FireSimWebGPU {
             maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
         };
 
+        // Request shader-f16 for half-precision burn_dist buffer
+        var requiredFeatures = [];
+        if (adapter.features.has('shader-f16')) {
+            requiredFeatures.push('shader-f16');
+        }
+        this.hasF16 = requiredFeatures.indexOf('shader-f16') >= 0;
+
         this.device = await adapter.requestDevice({
+            requiredFeatures: requiredFeatures,
             requiredLimits: {
                 maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
                 maxBufferSize: adapter.limits.maxBufferSize,
@@ -56,10 +64,11 @@ class FireSimWebGPU {
     getBufferMemoryUsage() {
         var s = this.simSize;
         var maskWords = Math.ceil(s / 32);
+        var burnDistBytes = this.hasF16 ? s * 8 * 2 : s * 8 * 4;
         return {
             ignTimeA: s * 4,
             ignTimeB: s * 4,
-            burnDist: s * 8 * 4,
+            burnDist: burnDistBytes,
             maxSpreadRate: s * 16 * 4,
             curSpreadRate: s * 16 * 4,
             intensityMod: s * 4,
@@ -69,7 +78,7 @@ class FireSimWebGPU {
             activeMask: maskWords * 4,
             staging: s * 4,
             uniforms: 84,
-            total: s * (4+4+32+64+64+4+4+4+4+4) + maskWords * 4 + 84,
+            total: s * (4+4+64+64+4+4+4+4+4) + burnDistBytes + maskWords * 4 + 84,
         };
     }
 
@@ -87,8 +96,13 @@ class FireSimWebGPU {
         const ignU32B = new Uint32Array(data.ignTimeIn.buffer.slice(0));
         this.ignTimeBufB = this._createStorageBuffer(ignU32B);
 
-        // Burn distances (8 per cell)
-        this.burnDistBuf = this._createStorageBuffer(data.burnDist);
+        // Burn distances (8 per cell, f16 if supported)
+        if (this.hasF16) {
+            var f16Data = this._packF32toF16(data.burnDist);
+            this.burnDistBuf = this._createStorageBuffer(f16Data);
+        } else {
+            this.burnDistBuf = this._createStorageBuffer(data.burnDist);
+        }
 
         // Spread rates (16 per cell)
         this.maxSpreadRateBuf = this._createStorageBuffer(data.maxspreadrate);
@@ -150,11 +164,43 @@ class FireSimWebGPU {
         });
         if (typedArray instanceof Float32Array) {
             new Float32Array(buf.getMappedRange()).set(typedArray);
+        } else if (typedArray instanceof Uint16Array) {
+            new Uint16Array(buf.getMappedRange()).set(typedArray);
         } else {
             new Uint32Array(buf.getMappedRange()).set(typedArray);
         }
         buf.unmap();
         return buf;
+    }
+
+    // Pack Float32Array into Uint16Array of IEEE 754 half-precision floats
+    _packF32toF16(f32arr) {
+        var u16 = new Uint16Array(f32arr.length);
+        var dv = new DataView(new ArrayBuffer(4));
+        for (var i = 0; i < f32arr.length; i++) {
+            dv.setFloat32(0, f32arr[i], true);
+            var bits = dv.getUint32(0, true);
+            var sign = (bits >> 31) & 1;
+            var exp = (bits >> 23) & 0xFF;
+            var frac = bits & 0x7FFFFF;
+            var h;
+            if (exp === 0) {
+                h = (sign << 15); // zero or subnormal → zero
+            } else if (exp === 0xFF) {
+                h = (sign << 15) | 0x7C00 | (frac ? 1 : 0); // inf or NaN
+            } else {
+                var newExp = exp - 127 + 15;
+                if (newExp >= 31) {
+                    h = (sign << 15) | 0x7C00; // overflow → inf
+                } else if (newExp <= 0) {
+                    h = (sign << 15); // underflow → zero
+                } else {
+                    h = (sign << 15) | (newExp << 10) | (frac >> 13);
+                }
+            }
+            u16[i] = h;
+        }
+        return u16;
     }
 
     async _loadShader(path) {
@@ -165,12 +211,21 @@ class FireSimWebGPU {
     async _createPipelines() {
         const device = this.device;
 
-        const [burnDistSrc, accelSrc, crownSrc, markActiveSrc] = await Promise.all([
+        var [burnDistSrc, accelSrc, crownSrc, markActiveSrc] = await Promise.all([
             this._loadShader('/static/js/shaders/burn_dist.wgsl'),
             this._loadShader('/static/js/shaders/accelerate.wgsl'),
             this._loadShader('/static/js/shaders/crown_rate.wgsl'),
             this._loadShader('/static/js/shaders/mark_active.wgsl'),
         ]);
+
+        // If f16 not supported, patch the shader to use f32 for burn_dist
+        if (!this.hasF16) {
+            burnDistSrc = burnDistSrc
+                .replace('enable f16;\n', '')
+                .replace(/array<f16>/g, 'array<f32>')
+                .replace(/f16\(/g, '(')
+                .replace(/f32\(burn_dist/g, 'burn_dist');
+        }
 
         // BurnDist pipeline
         this.burnDistPipeline = device.createComputePipeline({

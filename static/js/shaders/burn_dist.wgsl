@@ -1,6 +1,8 @@
 // burn_dist.wgsl — Port of kernel_BD.cu BurnDist kernel
 // Fire propagation via burn distance method
 
+enable f16;
+
 struct SimParams {
     size: u32,
     row_size: u32,
@@ -14,7 +16,7 @@ struct SimParams {
 
 @group(0) @binding(0) var<storage, read_write>  ign_time_in:     array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read_write>  ign_time_out:    array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read_write>  burn_dist:       array<f32>;
+@group(0) @binding(2) var<storage, read_write>  burn_dist:       array<f16>;
 @group(0) @binding(3) var<storage, read>        cur_spread_rate: array<f32>;
 @group(0) @binding(4) var<uniform>              params:          SimParams;
 @group(0) @binding(5) var<storage, read>        active_mask:     array<u32>;
@@ -88,10 +90,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         // Rate of spread in this direction (SoA layout: [dir * simSize + cell])
         let ROS = cur_spread_rate[n * sim_size + cell];
 
-        // Update burn distance
-        var dist = burn_dist[dist_cell + n];
+        // Update burn distance (f16 storage, f32 arithmetic)
+        var dist = f32(burn_dist[dist_cell + n]);
         dist = dist - ROS * time_step;
-        burn_dist[dist_cell + n] = dist;
+        burn_dist[dist_cell + n] = f16(dist);
 
         // Propagate fire when distance consumed
         if (dist <= 0.0) {
