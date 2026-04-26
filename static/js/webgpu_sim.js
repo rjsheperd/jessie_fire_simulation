@@ -318,6 +318,9 @@ class FireSimWebGPU {
         // Crown fire frequency: run every CROWN_INTERVAL steps
         const CROWN_INTERVAL = 10;
 
+        // Accelerate frequency: run every ACCEL_INTERVAL steps
+        const ACCEL_INTERVAL = 5;
+
         // Submit all steps without per-batch GPU sync
         const BATCH_SIZE = 50;
         for (let step = 0; step < stepCount; step += BATCH_SIZE) {
@@ -361,12 +364,14 @@ class FireSimWebGPU {
                     pass2.end();
                 }
 
-                // Pass 3: Accelerate
-                const pass3 = encoder.beginComputePass();
-                pass3.setPipeline(this.accelPipeline);
-                pass3.setBindGroup(0, this.accelBindGroup);
-                pass3.dispatchWorkgroups(cellWorkgroups);
-                pass3.end();
+                // Pass 3: Accelerate (every ACCEL_INTERVAL steps)
+                if (s % ACCEL_INTERVAL === 0) {
+                    const pass3 = encoder.beginComputePass();
+                    pass3.setPipeline(this.accelPipeline);
+                    pass3.setBindGroup(0, this.accelBindGroup);
+                    pass3.dispatchWorkgroups(cellWorkgroups);
+                    pass3.end();
+                }
             }
 
             device.queue.submit([encoder.finish()]);
