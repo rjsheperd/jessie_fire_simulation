@@ -72,10 +72,10 @@ class FireSimWebGPU {
             maxSpreadRate: s * 16 * 4,
             curSpreadRate: s * 16 * 4,
             packedScalars: s * 16,
-            activeMask: maskWords * 4,
+            activeIndices: s * 4,
             staging: s * 4,
             uniforms: 84,
-            total: s * (4+4+64+64+16+4) + burnDistBytes + maskWords * 4 + 84,
+            total: s * (4+4+64+64+16+4+4) + burnDistBytes + 16 + 84,
         };
     }
 
@@ -108,11 +108,22 @@ class FireSimWebGPU {
         // Per-cell scalars packed as vec4: [IM, accConst, I_o, RAC]
         this.packedScalarsBuf = this._createStorageBuffer(data.packedScalars);
 
-        // Active-cell bitmask (1 bit per cell, packed into u32 words)
-        this.maskWords = Math.ceil(simSize / 32);
-        this.activeMaskBuf = device.createBuffer({
-            size: this.maskWords * 4,
+        // Compacted active-cell index buffer (worst case: all cells active)
+        this.activeIndicesBuf = device.createBuffer({
+            size: simSize * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // Atomic counter for compaction (single u32)
+        this.activeCountBuf = device.createBuffer({
+            size: 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        // Indirect dispatch args buffer [workgroups_x, 1, 1]
+        this.indirectArgsBuf = device.createBuffer({
+            size: 12,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT,
         });
 
         // Simulation params uniform
@@ -121,12 +132,12 @@ class FireSimWebGPU {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        // Mark-active params uniform (size, row_size, col_size, pad)
-        this.markParamsBuf = device.createBuffer({
+        // Compact-active params uniform (size, row_size, col_size, pad)
+        this.compactParamsBuf = device.createBuffer({
             size: 16,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        device.queue.writeBuffer(this.markParamsBuf, 0, new Uint32Array([simSize, this.simRows, this.simCols, 0]));
+        device.queue.writeBuffer(this.compactParamsBuf, 0, new Uint32Array([simSize, this.simRows, this.simCols, 0]));
 
         // Accel params uniform
         this.accelParamsBuf = device.createBuffer({
@@ -205,11 +216,11 @@ class FireSimWebGPU {
     async _createPipelines() {
         const device = this.device;
 
-        var [burnDistSrc, accelSrc, crownSrc, markActiveSrc] = await Promise.all([
+        var [burnDistSrc, accelSrc, crownSrc, compactSrc] = await Promise.all([
             this._loadShader('/static/js/shaders/burn_dist.wgsl'),
             this._loadShader('/static/js/shaders/accelerate.wgsl'),
             this._loadShader('/static/js/shaders/crown_rate.wgsl'),
-            this._loadShader('/static/js/shaders/mark_active.wgsl'),
+            this._loadShader('/static/js/shaders/compact_active.wgsl'),
         ]);
 
         // If f16 not supported, patch the shader to use f32 for burn_dist
@@ -230,11 +241,11 @@ class FireSimWebGPU {
             },
         });
 
-        // Mark-active pipeline
-        this.markActivePipeline = device.createComputePipeline({
+        // Compact-active pipeline
+        this.compactPipeline = device.createComputePipeline({
             layout: 'auto',
             compute: {
-                module: device.createShaderModule({ code: markActiveSrc }),
+                module: device.createShaderModule({ code: compactSrc }),
                 entryPoint: 'main',
             },
         });
@@ -261,7 +272,7 @@ class FireSimWebGPU {
     _createBindGroups() {
         const device = this.device;
 
-        // BurnDist bind groups — two variants for ping-pong swap, now with active_mask
+        // BurnDist bind groups — two variants for ping-pong swap, with compacted active indices
         // Variant AB: A=read, B=write
         this.burnDistBindGroupAB = device.createBindGroup({
             layout: this.burnDistPipeline.getBindGroupLayout(0),
@@ -271,7 +282,7 @@ class FireSimWebGPU {
                 { binding: 2, resource: { buffer: this.burnDistBuf } },
                 { binding: 3, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 4, resource: { buffer: this.simParamsBuf } },
-                { binding: 5, resource: { buffer: this.activeMaskBuf } },
+                { binding: 5, resource: { buffer: this.activeIndicesBuf } },
             ],
         });
         // Variant BA: B=read, A=write
@@ -283,27 +294,31 @@ class FireSimWebGPU {
                 { binding: 2, resource: { buffer: this.burnDistBuf } },
                 { binding: 3, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 4, resource: { buffer: this.simParamsBuf } },
-                { binding: 5, resource: { buffer: this.activeMaskBuf } },
+                { binding: 5, resource: { buffer: this.activeIndicesBuf } },
             ],
         });
 
-        // Mark-active bind groups — two variants matching which ign_time buffer to read
+        // Compact-active bind groups — two variants matching which ign_time buffer to read
         // Variant A: read from buffer A
-        this.markActiveBindGroupA = device.createBindGroup({
-            layout: this.markActivePipeline.getBindGroupLayout(0),
+        this.compactBindGroupA = device.createBindGroup({
+            layout: this.compactPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.ignTimeBufA } },
-                { binding: 1, resource: { buffer: this.activeMaskBuf } },
-                { binding: 2, resource: { buffer: this.markParamsBuf } },
+                { binding: 1, resource: { buffer: this.activeCountBuf } },
+                { binding: 2, resource: { buffer: this.activeIndicesBuf } },
+                { binding: 3, resource: { buffer: this.indirectArgsBuf } },
+                { binding: 4, resource: { buffer: this.compactParamsBuf } },
             ],
         });
         // Variant B: read from buffer B
-        this.markActiveBindGroupB = device.createBindGroup({
-            layout: this.markActivePipeline.getBindGroupLayout(0),
+        this.compactBindGroupB = device.createBindGroup({
+            layout: this.compactPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.ignTimeBufB } },
-                { binding: 1, resource: { buffer: this.activeMaskBuf } },
-                { binding: 2, resource: { buffer: this.markParamsBuf } },
+                { binding: 1, resource: { buffer: this.activeCountBuf } },
+                { binding: 2, resource: { buffer: this.activeIndicesBuf } },
+                { binding: 3, resource: { buffer: this.indirectArgsBuf } },
+                { binding: 4, resource: { buffer: this.compactParamsBuf } },
             ],
         });
 
@@ -337,9 +352,7 @@ class FireSimWebGPU {
 
         const device = this.device;
         const simSize = this.simSize;
-        const workgroups = Math.ceil(simSize / 256);
         const cellWorkgroups = Math.ceil(simSize / 256);
-        const maskWorkgroups = Math.ceil(simSize / 256); // one thread per cell for mark_active
         const timestep = this.timestep;
 
         // Update accel params once (static for the whole run)
@@ -360,8 +373,9 @@ class FireSimWebGPU {
         paramF32[6] = 0;             // pad
         paramF32[7] = 0;             // pad
 
-        // Zero buffer for clearing the bitmask each step
-        const zeroMask = new Uint32Array(this.maskWords);
+        // Zero buffers for clearing compaction state each step
+        const zeroCount = new Uint32Array([0]);
+        const zeroIndirect = new Uint32Array([0, 1, 1]);
 
         // Crown fire frequency: run every CROWN_INTERVAL steps
         const CROWN_INTERVAL = 10;
@@ -381,23 +395,24 @@ class FireSimWebGPU {
                 paramF32[5] = s * timestep;
                 device.queue.writeBuffer(this.simParamsBuf, 0, paramTemplate);
 
-                // Clear the active bitmask to zero before marking
-                device.queue.writeBuffer(this.activeMaskBuf, 0, zeroMask);
+                // Clear compaction counter and indirect args before compact pass
+                device.queue.writeBuffer(this.activeCountBuf, 0, zeroCount);
+                device.queue.writeBuffer(this.indirectArgsBuf, 0, zeroIndirect);
 
-                // Pass 0: Mark active cells (reads current read-buffer)
-                var markBG = (this._pingPong === 0) ? this.markActiveBindGroupA : this.markActiveBindGroupB;
+                // Pass 0: Compact active cells (builds active_indices + indirect args)
+                var compactBG = (this._pingPong === 0) ? this.compactBindGroupA : this.compactBindGroupB;
                 const pass0 = encoder.beginComputePass();
-                pass0.setPipeline(this.markActivePipeline);
-                pass0.setBindGroup(0, markBG);
-                pass0.dispatchWorkgroups(maskWorkgroups);
+                pass0.setPipeline(this.compactPipeline);
+                pass0.setBindGroup(0, compactBG);
+                pass0.dispatchWorkgroups(cellWorkgroups);
                 pass0.end();
 
-                // Pass 1: BurnDist with ping-pong bind group + active mask
+                // Pass 1: BurnDist with indirect dispatch (only active cells)
                 var burnDistBG = (this._pingPong === 0) ? this.burnDistBindGroupAB : this.burnDistBindGroupBA;
                 const pass1 = encoder.beginComputePass();
                 pass1.setPipeline(this.burnDistPipeline);
                 pass1.setBindGroup(0, burnDistBG);
-                pass1.dispatchWorkgroups(workgroups);
+                pass1.dispatchWorkgroupsIndirect(this.indirectArgsBuf, 0);
                 pass1.end();
 
                 // Swap ping-pong: output becomes next step's input
@@ -458,13 +473,12 @@ class FireSimWebGPU {
         if (this.burnDistBuf) this.burnDistBuf.destroy();
         if (this.maxSpreadRateBuf) this.maxSpreadRateBuf.destroy();
         if (this.curSpreadRateBuf) this.curSpreadRateBuf.destroy();
-        if (this.intensityModBuf) this.intensityModBuf.destroy();
-        if (this.accConstBuf) this.accConstBuf.destroy();
-        if (this.ioBuf) this.ioBuf.destroy();
-        if (this.racBuf) this.racBuf.destroy();
-        if (this.activeMaskBuf) this.activeMaskBuf.destroy();
+        if (this.packedScalarsBuf) this.packedScalarsBuf.destroy();
+        if (this.activeIndicesBuf) this.activeIndicesBuf.destroy();
+        if (this.activeCountBuf) this.activeCountBuf.destroy();
+        if (this.indirectArgsBuf) this.indirectArgsBuf.destroy();
         if (this.simParamsBuf) this.simParamsBuf.destroy();
-        if (this.markParamsBuf) this.markParamsBuf.destroy();
+        if (this.compactParamsBuf) this.compactParamsBuf.destroy();
         if (this.accelParamsBuf) this.accelParamsBuf.destroy();
         if (this.crownParamsBuf) this.crownParamsBuf.destroy();
         if (this.stagingBuf) this.stagingBuf.destroy();
