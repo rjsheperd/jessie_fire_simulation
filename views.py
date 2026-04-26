@@ -1,9 +1,19 @@
-from flask import Flask, render_template, send_from_directory, request
+from flask import Flask, render_template, send_from_directory, request, jsonify
 import util
 import os
 import shutil
 import time
 app = Flask(__name__)
+from flask_cors import CORS
+CORS(app)
+
+# Enable cross-origin isolation for SharedArrayBuffer (required for Web Workers zero-copy)
+# Uses 'credentialless' COEP to avoid breaking external CDN resources (Google Maps, jQuery)
+@app.after_request
+def add_cross_origin_headers(response):
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Embedder-Policy'] = 'credentialless'
+    return response
 
 app_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -262,6 +272,46 @@ def get_err_log():
     folder = app_path + '/'
     return send_from_directory(directory=app_path, filename=filename)
 
+@app.route('/api/sim_data_manifest')
+def sim_data_manifest():
+    """Return paths and metadata for all simulation input files.
+    The browser fetches each file individually and parses them in JS.
+    Accepts query params for stress testing: cols, rows, steps, mode."""
+    cols = request.args.get('cols', 906, type=int)
+    rows = request.args.get('rows', 642, type=int)
+    steps = request.args.get('steps', 600, type=int)
+    mode = request.args.get('mode', 'real')
+
+    manifest = {
+        'sim_cols': cols,
+        'sim_rows': rows,
+        'step_count': steps,
+        'foliar_moisture': 1.0,
+        'mode': mode,
+    }
+
+    if mode == 'real':
+        manifest.update({
+            'fuel_file': '/static/data/temp_upload_fuel',
+            'fire_file': '/static/data/temp_upload_onfire',
+            'terrain_bin': '/static/data/terrain_sae.bin',
+            'canopy_ht': '/sim_data/canopy_ht.asc',
+            'crown_base_ht': '/sim_data/crown_base_ht.asc',
+            'crown_bulk_density': '/sim_data/crown_bulk_density.asc',
+            'wind_x': '/sim_data/windx.fuel',
+            'wind_y': '/sim_data/windy.fuel',
+            'fuel_models': '/sim_data/default.fmd',
+            'fuel_moisture': '/sim_data/kyle.fms',
+        })
+
+    return jsonify(manifest)
+
+@app.route('/sim_data/<path:filename>')
+def serve_sim_data(filename):
+    """Serve files from fire_sim_lib/data/ directory."""
+    sim_data_dir = os.path.join(app_path, 'fire_sim_lib', 'data')
+    return send_from_directory(sim_data_dir, filename)
+
 if __name__ == '__main__':
     app.debug = True
-    app.run(host='0.0.0.0')
+    app.run(host='0.0.0.0', port=5001)

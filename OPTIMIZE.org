@@ -174,18 +174,21 @@ Rothermel parameters.
 
 Complexity: very high. Requires multi-resolution data structures on GPU.
 
-** TODO CPU Rothermel parallelization (Web Workers)
+** DONE CPU Rothermel parallelization (Web Workers)
 
-=updateSpreadData()= does ~500–800 FLOPs per cell single-threaded. For 2M+
-cells this takes 300–500 ms.
+Implemented: =rothermel_worker.js= Web Worker, =rothermel.js= made chunk-aware
+(=startCell/endCell= params), =webgpu_main.js= dispatches N workers via
+SharedArrayBuffer (zero-copy). Flask serves COOP+COEP =credentialless= headers.
 
-*Approach:* Partition the grid into chunks, run each chunk in a Web Worker.
-Rothermel is purely local (no neighbor dependencies), so parallelism is
-embarrassingly parallel. 8 workers → ~8× speedup on the CPU portion.
+Result: *neutral on 906×642* (1277ms vs 1309ms). Worker startup + merge
+overhead (~400ms) offsets parallelism gains for 581K cells. Will scale at
+2M+ cells where single-threaded Rothermel takes 2–3s.
 
 Files:
-- =static/js/rothermel.js= — make =updateSpreadData= chunk-aware
+- =static/js/rothermel.js= — =updateSpreadData= + =computeDirectionalRates= accept =startCell/endCell=
 - New: =static/js/rothermel_worker.js= — worker entry point
+- =static/js/webgpu_main.js= — worker pool with SharedArrayBuffer, sequential fallback
+- =views.py= — COOP + COEP =credentialless= headers
 
 * Phase 3: Memory Layout Optimization [0/3]
 
@@ -256,9 +259,11 @@ bun run test_stress.mjs --suite correctness
 #+END_SRC
 
 Key metrics:
-| Metric          | Baseline | Phase 0 Actual | Phase 1 Actual | Phase 1 Target |
-|-----------------+----------+----------------+----------------+----------------|
-| GPU run (ms)    |      970 |            678 |            273 | 100–300        |
-| Total (ms)      |     1900 |           1625 |           1309 | 800–1200       |
-| Memory (MB)     |      109 |            109 |            109 | 105            |
-| Correctness (%) |     41.5 |           pass |           pass | pass           |
+| Metric          | Baseline | Phase 0 | Phase 1 (GPU) | Phase 2 (Workers) |
+|-----------------+----------+---------+---------------+-------------------|
+| GPU run (ms)    |      970 |     678 |           273 |               283 |
+| Total (ms)      |     1900 |    1625 |          1309 |              1277 |
+| Memory (MB)     |      109 |     109 |           109 |               109 |
+| Correctness     |     pass |    pass |          pass |              pass |
+| Speedup (GPU)   |       1× |   1.43× |         3.55× |             3.43× |
+| Speedup (Total) |       1× |   1.17× |         1.45× |             1.49× |
