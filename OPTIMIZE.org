@@ -1,0 +1,265 @@
+#+TITLE: WebGPU Fire Simulation — Optimization Plan
+#+AUTHOR: RJ Sheperd
+#+DATE: 2026-04-25
+
+* Context
+
+The CUDA-to-WebGPU port runs 600 timesteps on a 906×642 grid (~581K cells) in
+~1s GPU time, ~2s total on Apple Silicon via Brave. The simulation is
+*memory-bandwidth bound*: 600 steps × ~65 bytes touched per cell per step ≈ 22 GB
+of traffic against Apple Silicon's ~100–200 GB/s bandwidth ceiling.
+
+Four passes execute per timestep:
+1. *BurnDist* — propagation kernel, 8 neighbors per cell, atomic CAS min-float
+2. *CopyKernel* — ping-pong: copy =ign_time_out= (atomic u32) → =ign_time_in= (f32)
+3. *CrownRate* — crown fire escalation (~1.3% of threads do real work)
+4. *Accelerate* — ramp =curspreadrate= toward =maxspreadrate=, 16 directions/cell
+
+Baseline measurements (906×642, 600 steps, Apple Silicon):
+- GPU run: ~970 ms
+- Readback: ~4 ms
+- Total (including CPU Rothermel): ~1.9 s
+
+* Phase 0: GPU Micro-Optimizations [4/4]                              :done:
+
+Achieved speedup: *1.43× GPU* (970→678 ms), *1.17× total* (1900→1625 ms).
+No algorithmic changes — eliminated waste in the 4-pass loop.
+Three passes now execute per timestep (copy kernel removed):
+1. *BurnDist* — propagation kernel, 8 neighbors per cell, atomic CAS min-float
+2. *CrownRate* — crown fire escalation (every 10th step)
+3. *Accelerate* — ramp curspreadrate toward maxspreadrate
+
+** DONE Eliminate copy kernel (dual atomic buffer swap)
+
+The copy kernel dispatches 581K threads every step just to move data between
+two buffers. That's 2.2 MB per step, 1.3 GB total over 600 steps — pure waste.
+
+*Approach:* Make both =ign_time_in= and =ign_time_out= atomic u32 buffers. Each
+step, swap which buffer is "read" vs "write" by alternating bind groups. The
+BurnDist shader reads via =atomicLoad= and bitcasts to f32 instead of reading
+a plain =array<f32>=.
+
+Files:
+- =static/js/shaders/burn_dist.wgsl= — change =ign_time_in= from =array<f32>=
+  to =array<atomic<u32>>=, read via =bitcast<f32>(atomicLoad(...))=
+- =static/js/webgpu_sim.js= — remove =copyPipeline=, =copyBindGroup=,
+  =copyParamsBuf=. Create two bind groups for BurnDist (A→B and B→A), swap
+  each step. Track which buffer holds current state for readback.
+- =static/js/shaders/copy_kernel.wgsl= — no longer dispatched (keep file for
+  reference)
+
+** DONE Remove per-batch GPU stalls
+
+=webgpu_sim.js:325= calls =await device.queue.onSubmittedWorkDone()= after every
+50-step batch. This forces a CPU–GPU sync 12 times per run, adding pipeline
+bubble overhead.
+
+*Approach:* Submit all command buffers without awaiting. Single
+=onSubmittedWorkDone()= after the final submit. Keep progress callback by
+counting submitted batches (no GPU sync needed for progress reporting).
+
+Files:
+- =static/js/webgpu_sim.js= — restructure =run()= loop
+
+** DONE Pre-bake uniform buffer (eliminate per-step writeBuffer)
+
+=webgpu_sim.js:289= calls =device.queue.writeBuffer()= 600 times to update
+=current_time= in the sim params uniform. Each call is a CPU→GPU copy with
+driver overhead.
+
+*Approach:* Add a =step_index= field to =SimParams=. The shader computes
+=current_time = f32(step_index) * time_step=. Host writes the uniform once
+before the run with =time_step=, then updates only the 4-byte =step_index=
+via a single =writeBuffer= per step — or better, encode the step index into
+a dynamic offset. Alternatively, pre-allocate a buffer with all 600 param
+snapshots and use =setBindGroup= with dynamic offsets.
+
+Files:
+- =static/js/shaders/burn_dist.wgsl= — compute =current_time= from =step_index=
+- =static/js/webgpu_sim.js= — pre-write all params or use step counter
+
+** DONE Crown fire pass frequency reduction
+
+=crown_rate.wgsl= dispatches over all cells but ~98.7% exit at the first
+=max_spread_rate <= 0= check. Crown fire transitions are rare and slow-changing.
+
+*Approach:* Run the crown pass every 10th step instead of every step. The fire
+front advances ~0.3 cells/step on average, so crowning state is nearly
+identical across consecutive steps.
+
+Files:
+- =static/js/webgpu_sim.js= — add =if (s % 10 === 0)= guard around crown dispatch
+
+* Phase 1: Reduce Redundant Cell Work [0/3]
+
+Expected speedup: *2–5×* on top of Phase 0. Skip cells that can't possibly
+change this timestep.
+
+** TODO Active-cell bitmask
+
+Most cells are either unburnable, already burnt, or far from the fire front.
+Only cells near the active front need BurnDist computation.
+
+*Approach:* Maintain a GPU-side bitmask (1 bit per cell, ~71 KB for 581K cells).
+A cell is "active" if it or any neighbor ignited in the last N steps. A
+lightweight prefix kernel updates the bitmask each step. BurnDist skips
+inactive cells via early-exit.
+
+Complexity: medium. Requires an extra kernel and careful bitmask update logic.
+
+** TODO Skip accelerate/crown for non-burning cells
+
+Accelerate iterates 16 directions for every cell, even non-burnable ones. The
+=max_spread_rate[cell_base] <= 0= early-exit helps but still dispatches threads.
+
+*Approach:* Gate both accelerate and crown passes on the active-cell bitmask
+from above.
+
+** TODO Compacted dispatch via indirect workgroups
+
+Instead of dispatching over all cells and early-exiting, build a compacted
+index buffer of active cells using a prefix-sum scan. Use
+=dispatchWorkgroupsIndirect= to launch only as many threads as needed.
+
+*Approach:* Two-phase: (1) scan kernel marks active cells and does parallel
+prefix sum, (2) BurnDist/Accelerate/Crown read from the compacted index.
+
+Complexity: high. Prefix-sum on GPU is well-studied but adds implementation
+weight. Only worthwhile if the active fraction is <20% of total cells.
+
+* Phase 2: Algorithmic Improvements [0/4]
+
+Expected speedup: *5–50×* depending on landscape. Fundamental changes to how
+the simulation advances.
+
+** TODO Fast Iterative Method (FIM)
+
+Replace the fixed-timestep BD loop with FIM, which converges in O(narrow-band
+width) iterations instead of O(grid-diameter / ROS / dt).
+
+FIM maintains an "active list" of cells at the wavefront. Each iteration:
+1. For each active cell, solve the Eikonal equation using neighbor values
+2. If the solution changed by less than ε, mark converged and remove
+3. Add newly-reached neighbors to the active list
+
+On GPU: active list is a ping-pong buffer. Each iteration dispatches only
+active-list-size threads. Convergence is typically 5–20 iterations per cell.
+
+For 600 steps of BD on a 906×642 grid, FIM would need ~50–200 total
+iterations (not per-cell), each touching only the narrow band (~5K cells).
+
+References:
+- Jeong & Whitaker 2008, "A Fast Iterative Method for Eikonal Equations"
+- Weber et al. 2015, "Efficient GPU Implementation of the FIM for Fire Spread"
+
+** TODO Anisotropic Eikonal formulation
+
+The current 16-direction decomposition is a discretization artifact from the
+original C++ code. The Eikonal equation =|∇T| = 1/F(x,θ)= handles arbitrary
+anisotropy natively via the Rothermel ellipse.
+
+*Approach:* Replace the 16-direction burn distance arrays (64 bytes/cell) with
+a 2×2 anisotropy tensor per cell (16 bytes/cell) encoding the Rothermel
+ellipse. FIM's Eikonal solver uses this tensor directly.
+
+Saves 4× memory per cell and eliminates the 16-direction loop in accelerate.
+
+** TODO Adaptive timestep / level-of-detail
+
+Uniform timestep wastes work: fast-spreading areas need small dt while
+slow/inactive areas could use dt 10× larger.
+
+*Approach:* Hierarchical grid with coarse cells (4×4 or 8×8 blocks) that
+refine only when the fire front enters them. Coarse cells use averaged
+Rothermel parameters.
+
+Complexity: very high. Requires multi-resolution data structures on GPU.
+
+** TODO CPU Rothermel parallelization (Web Workers)
+
+=updateSpreadData()= does ~500–800 FLOPs per cell single-threaded. For 2M+
+cells this takes 300–500 ms.
+
+*Approach:* Partition the grid into chunks, run each chunk in a Web Worker.
+Rothermel is purely local (no neighbor dependencies), so parallelism is
+embarrassingly parallel. 8 workers → ~8× speedup on the CPU portion.
+
+Files:
+- =static/js/rothermel.js= — make =updateSpreadData= chunk-aware
+- New: =static/js/rothermel_worker.js= — worker entry point
+
+* Phase 3: Memory Layout Optimization [0/3]
+
+Expected speedup: *1.2–1.5×* (compounds with other phases). Better cache
+utilization through data layout changes.
+
+** TODO Structure-of-Arrays → tiled layout
+
+Current layout: =curspreadrate[cell * 16 + dir]= interleaves 16 directions per
+cell. BurnDist only reads 8 of 16 directions per cell, and accesses
+=curspreadrate[neighbor_cell * 16 + dir]= — a stride-16 access pattern that
+defeats GPU cache lines.
+
+*Approach:* Reorganize as =curspreadrate[dir * simSize + cell]=. BurnDist then
+reads =curspreadrate[dir * simSize + neighbor_cell]= — contiguous for
+neighboring cells within a workgroup, much better coalescing.
+
+** TODO Reduce burn_dist from f32 to f16
+
+=burn_dist= is 8 floats per cell (32 bytes). The values are distances in
+meters, typically 0–100. f16 gives ~0.01m precision, more than sufficient.
+
+*Approach:* Use =array<f16>= in WGSL (requires =f16= extension). Halves
+burn_dist buffer size and memory bandwidth.
+
+** TODO Pack read-only per-cell scalars
+
+=intensity_modifier=, =acc_const=, =I_o=, =RAC= are each separate f32 buffers.
+Packing them into a single =vec4<f32>= buffer reduces bind group entries and
+may improve cache locality for crown/accelerate passes.
+
+* Phase 4: Alternative Propagation Models [0/2]
+
+These are research-grade changes that would fundamentally alter the simulation
+model. Listed for completeness.
+
+** TODO Huygens' wavelet method (FARSITE/Prometheus)
+
+Instead of cell-based propagation, track the fire perimeter as a polygon and
+advance it using Rothermel ellipses at each vertex. Eliminates grid
+discretization artifacts entirely.
+
+Used by FARSITE (US) and Prometheus (Canada). GPU implementations exist but
+are complex (dynamic polygon management, vertex splitting/merging).
+
+** TODO Level-set method
+
+Represent the fire front as the zero level set of a signed distance function.
+Advance using the Hamilton-Jacobi equation. Handles topology changes (merging
+fronts) naturally.
+
+GPU-friendly (regular grid operations), but requires reinitialization steps
+to maintain the signed distance property.
+
+* Measurement Protocol
+
+After each phase, re-run stress tests to measure improvement:
+
+#+BEGIN_SRC shell
+# Start Flask server
+python views.py -p 5001
+
+# Run performance suite
+bun run test_stress.mjs --suite perf
+
+# Run correctness suite (must still pass)
+bun run test_stress.mjs --suite correctness
+#+END_SRC
+
+Key metrics:
+| Metric          | Baseline | Phase 0 Target | Phase 0 Actual | Phase 1 Target |
+|-----------------+----------+-----------------+----------------+----------------|
+| GPU run (ms)    |      970 | 500–650         |            678 | 100–300        |
+| Total (ms)      |     1900 | 1400–1600       |           1625 | 800–1200       |
+| Memory (MB)     |      109 | 105             |            109 | 105            |
+| Correctness (%) |     41.5 | 41.5            |           pass | 41.5           |
