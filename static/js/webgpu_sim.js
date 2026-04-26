@@ -71,14 +71,11 @@ class FireSimWebGPU {
             burnDist: burnDistBytes,
             maxSpreadRate: s * 16 * 4,
             curSpreadRate: s * 16 * 4,
-            intensityMod: s * 4,
-            accConst: s * 4,
-            I_o: s * 4,
-            RAC: s * 4,
+            packedScalars: s * 16,
             activeMask: maskWords * 4,
             staging: s * 4,
             uniforms: 84,
-            total: s * (4+4+64+64+4+4+4+4+4) + burnDistBytes + maskWords * 4 + 84,
+            total: s * (4+4+64+64+16+4) + burnDistBytes + maskWords * 4 + 84,
         };
     }
 
@@ -108,11 +105,8 @@ class FireSimWebGPU {
         this.maxSpreadRateBuf = this._createStorageBuffer(data.maxspreadrate);
         this.curSpreadRateBuf = this._createStorageBuffer(data.curspreadrate);
 
-        // Per-cell scalars
-        this.intensityModBuf = this._createStorageBuffer(data.intensityModifier);
-        this.accConstBuf = this._createStorageBuffer(data.accelerationConstant);
-        this.ioBuf = this._createStorageBuffer(data.I_o);
-        this.racBuf = this._createStorageBuffer(data.RAC);
+        // Per-cell scalars packed as vec4: [IM, accConst, I_o, RAC]
+        this.packedScalarsBuf = this._createStorageBuffer(data.packedScalars);
 
         // Active-cell bitmask (1 bit per cell, packed into u32 words)
         this.maskWords = Math.ceil(simSize / 32);
@@ -313,27 +307,25 @@ class FireSimWebGPU {
             ],
         });
 
-        // Accelerate bind group
+        // Accelerate bind group (packed_scalars replaces acc_const)
         this.accelBindGroup = device.createBindGroup({
             layout: this.accelPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 1, resource: { buffer: this.maxSpreadRateBuf } },
-                { binding: 2, resource: { buffer: this.accConstBuf } },
+                { binding: 2, resource: { buffer: this.packedScalarsBuf } },
                 { binding: 3, resource: { buffer: this.accelParamsBuf } },
             ],
         });
 
-        // Crown rate bind group
+        // Crown rate bind group (packed_scalars replaces IM, I_o, RAC)
         this.crownBindGroup = device.createBindGroup({
             layout: this.crownPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: this.curSpreadRateBuf } },
                 { binding: 1, resource: { buffer: this.maxSpreadRateBuf } },
-                { binding: 2, resource: { buffer: this.intensityModBuf } },
-                { binding: 3, resource: { buffer: this.ioBuf } },
-                { binding: 4, resource: { buffer: this.racBuf } },
-                { binding: 5, resource: { buffer: this.crownParamsBuf } },
+                { binding: 2, resource: { buffer: this.packedScalarsBuf } },
+                { binding: 3, resource: { buffer: this.crownParamsBuf } },
             ],
         });
     }

@@ -278,15 +278,21 @@ async function runWebGPUSimulation() {
         // Create and run WebGPU simulation
         console.log('WebGPU: Initializing GPU...');
         webgpuSim = new FireSimWebGPU();
+        // Pack per-cell scalars into vec4: [IM, accConst, I_o, RAC]
+        var packedScalars = new Float32Array(SIM_SIZE * 4);
+        for (var i = 0; i < SIM_SIZE; i++) {
+            packedScalars[i * 4 + 0] = dirRates.intensityModifier[i];
+            packedScalars[i * 4 + 1] = dirRates.accelerationConstant[i];
+            packedScalars[i * 4 + 2] = I_o[i];
+            packedScalars[i * 4 + 3] = RAC[i];
+        }
+
         await webgpuSim.init(SIM_COLS, SIM_ROWS, {
             ignTimeIn: ignTimeIn,
             burnDist: burnDist,
             maxspreadrate: dirRates.maxspreadrate,
             curspreadrate: dirRates.curspreadrate,
-            intensityModifier: dirRates.intensityModifier,
-            accelerationConstant: dirRates.accelerationConstant,
-            I_o: I_o,
-            RAC: RAC,
+            packedScalars: packedScalars,
             timestep: dirRates.timestep,
         });
 
@@ -424,16 +430,22 @@ async function rerunWebGPUSimulation(fireGrid2D, vegGrid2D) {
         var burnDist = initBurnDistances(c.SIM_SIZE, dirRates.l_n);
 
         // Run simulation
+        // Pack per-cell scalars into vec4: [IM, accConst, I_o, RAC]
+        var packedScalars = new Float32Array(c.SIM_SIZE * 4);
+        for (var i = 0; i < c.SIM_SIZE; i++) {
+            packedScalars[i * 4 + 0] = dirRates.intensityModifier[i];
+            packedScalars[i * 4 + 1] = dirRates.accelerationConstant[i];
+            packedScalars[i * 4 + 2] = c.I_o[i];
+            packedScalars[i * 4 + 3] = c.RAC[i];
+        }
+
         var sim = new FireSimWebGPU();
         await sim.init(c.SIM_COLS, c.SIM_ROWS, {
             ignTimeIn: ignTimeIn,
             burnDist: burnDist,
             maxspreadrate: dirRates.maxspreadrate,
             curspreadrate: dirRates.curspreadrate,
-            intensityModifier: dirRates.intensityModifier,
-            accelerationConstant: dirRates.accelerationConstant,
-            I_o: c.I_o,
-            RAC: c.RAC,
+            packedScalars: packedScalars,
             timestep: dirRates.timestep,
         });
 

@@ -9,10 +9,10 @@ struct AccelParams {
     _pad1: f32,
 };
 
-@group(0) @binding(0) var<storage, read_write>  cur_spread_rate: array<f32>;
-@group(0) @binding(1) var<storage, read>        max_spread_rate: array<f32>;
-@group(0) @binding(2) var<storage, read>        acc_const:       array<f32>;
-@group(0) @binding(3) var<uniform>              params:          AccelParams;
+@group(0) @binding(0) var<storage, read_write>  cur_spread_rate:  array<f32>;
+@group(0) @binding(1) var<storage, read>        max_spread_rate:  array<f32>;
+@group(0) @binding(2) var<storage, read>        packed_scalars:   array<vec4<f32>>;  // [IM, accConst, I_o, RAC]
+@group(0) @binding(3) var<uniform>              params:           AccelParams;
 
 fn clamp_val(val: f32, flr: f32, ceiling: f32) -> f32 {
     return max(flr, min(val, ceiling));
@@ -31,7 +31,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    let acceleration_constant = acc_const[cell];
+    let acceleration_constant = packed_scalars[cell].y;
     let time_step = params.time_step;
     let sim_size = params.sim_size;
 

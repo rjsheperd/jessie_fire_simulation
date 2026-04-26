@@ -190,7 +190,7 @@ Files:
 - =static/js/webgpu_main.js= — worker pool with SharedArrayBuffer, sequential fallback
 - =views.py= — COOP + COEP =credentialless= headers
 
-* Phase 3: Memory Layout Optimization [2/3]                       :current:
+* Phase 3: Memory Layout Optimization [3/3]                          :done:
 
 Expected speedup: *1.2–1.5×* (compounds with other phases). Better cache
 utilization through data layout changes.
@@ -228,11 +228,23 @@ Files changed:
 - =static/js/webgpu_sim.js= — =shader-f16= feature, =_packF32toF16()=,
   =Uint16Array= handling in =_createStorageBuffer=, conditional buffer sizing
 
-** TODO Pack read-only per-cell scalars
+** DONE Pack read-only per-cell scalars
 
-=intensity_modifier=, =acc_const=, =I_o=, =RAC= are each separate f32 buffers.
-Packing them into a single =vec4<f32>= buffer reduces bind group entries and
-may improve cache locality for crown/accelerate passes.
+Packed =intensity_modifier=, =acc_const=, =I_o=, =RAC= into a single
+=array<vec4<f32>>= buffer (=packed_scalars=). Reduces 4 GPU buffers → 1,
+6 bind group entries → 1 for crown, 4 → 4 (same count) for accelerate.
+Crown shader loads all scalars in a single =vec4= read per cell.
+
+Result: GPU 260→221ms (*1.18× within-phase*). Combined from baseline:
+970→221ms (*4.39× total GPU speedup*). Total 1393→1205ms (*1.58× from baseline*).
+Memory: same total (=vec4= packs 4 × f32 per cell = 16 bytes, same as 4
+separate f32 buffers).
+
+Files changed:
+- =static/js/shaders/accelerate.wgsl= — =packed_scalars[cell].y= for acc_const
+- =static/js/shaders/crown_rate.wgsl= — =packed_scalars[cell]= vec4 for IM/I_o/RAC
+- =static/js/webgpu_sim.js= — single =packedScalarsBuf=, updated bind groups
+- =static/js/webgpu_main.js= — pack 4 arrays into interleaved vec4 Float32Array
 
 * Phase 4: Alternative Propagation Models [0/2]
 
@@ -273,11 +285,11 @@ bun run test_stress.mjs --suite correctness
 #+END_SRC
 
 Key metrics:
-| Metric          | Baseline | Phase 0 | Phase 1 | Phase 2 | Phase 3 (SoA) | Phase 3 (f16) |
-|-----------------+----------+---------+---------+---------+---------------+---------------|
-| GPU run (ms)    |      970 |     678 |     273 |     283 |           240 |           260 |
-| Total (ms)      |     1900 |    1625 |    1309 |    1277 |          1242 |          1393 |
-| Memory (MB)     |      109 |     109 |     109 |     109 |           109 |           105 |
-| Correctness     |     pass |    pass |    pass |    pass |          pass |          pass |
-| Speedup (GPU)   |       1× |   1.43× |   3.55× |   3.43× |         4.04× |         3.73× |
-| Speedup (Total) |       1× |   1.17× |   1.45× |   1.49× |         1.53× |         1.36× |
+| Metric          | Baseline | Phase 0 | Phase 1 | Phase 2 | Phase 3 (SoA) | Phase 3 (f16) | Phase 3 (pack) |
+|-----------------+----------+---------+---------+---------+---------------+---------------+----------------|
+| GPU run (ms)    |      970 |     678 |     273 |     283 |           240 |           260 |            221 |
+| Total (ms)      |     1900 |    1625 |    1309 |    1277 |          1242 |          1393 |           1205 |
+| Memory (MB)     |      109 |     109 |     109 |     109 |           109 |           105 |            105 |
+| Correctness     |     pass |    pass |    pass |    pass |          pass |          pass |           pass |
+| Speedup (GPU)   |       1× |   1.43× |   3.55× |   3.43× |         4.04× |         3.73× |          4.39× |
+| Speedup (Total) |       1× |   1.17× |   1.45× |   1.49× |         1.53× |         1.36× |          1.58× |
